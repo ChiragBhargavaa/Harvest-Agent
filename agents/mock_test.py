@@ -276,6 +276,8 @@ async def unit_tests():
     check([x["name"] for x in out["call_list"]] == ["Chai Point Corner"], "phone-only business goes to call list")
 
     await finder_unit_tests()
+    await finder_budget_tests()
+    await dedupe_request_tests()
     await banned_osm_website_test()
     dedupe_unit_tests()
     timeout_unit_tests()
@@ -322,11 +324,12 @@ async def finder_unit_tests():
 
     out, took = await _find_with(slow_search, ["q1", "q2", "q3", "q4"])
     names = [x["name"] for x in out["leads"]]
-    check(took < 0.5 and sorted(started) == ["q1", "q2", "q3"],
-          f"finder: ≤3 web-search queries run concurrently ({took:.2f}s < 0.6s sequential; ran {sorted(started)})")
+    check(took < 0.4 and sorted(started) == ["q1", "q2"],
+          f"finder: ≤2 web-search queries run concurrently ({took:.2f}s < 0.4s sequential; ran {sorted(started)})")
     check("Brew Lab Roasters" in names and "Fourth Query Cafe" not in names
           and next(x for x in out["leads"] if x["name"] == "Brew Lab Roasters")["website"] == "https://brewlab.test",
           "finder: concurrent results merged in query order")
+    out, _ = await _find_with(slow_search, ["q1", "q3"])
     check(any(n == "Web search failed for 'q3': ASI:One unavailable" for n in out["source_notes"])
           and len(out["leads"]) == 3, "finder: one failed query -> a note, the other queries' leads kept")
 
@@ -349,14 +352,17 @@ async def finder_unit_tests():
         raise RuntimeError(f"Overpass 500, key {key}")
 
     geo.find_businesses, original_osm = osm_down, geo.find_businesses
+    notes = ""
     try:
         out, _ = await _find_with(leaky, ["q1"])
+    except RuntimeError as err:  # both sources down -> zero leads -> error (its text carries the notes)
+        notes = str(err)
     finally:
         geo.find_businesses = original_osm
-    notes = " ".join(out["source_notes"])
-    check(key not in notes and "abcdef123456" not in notes and "Web search failed for 'q1': 401 bad key ***" in notes
+    check(notes.startswith("no leads found") and key not in notes and "abcdef123456" not in notes
+          and "Web search failed for 'q1': 401 bad key ***" in notes
           and "OpenStreetMap failed (Overpass 500, key ***)" in notes,
-          f"finder: web-search and OSM error text is redacted in source_notes ({out['source_notes']})")
+          f"finder: web-search and OSM error text is redacted in source_notes / the zero-leads error ({notes[:120]})")
 
     async def hanging_websites(businesses, city):
         await asyncio.sleep(5)
@@ -369,6 +375,91 @@ async def finder_unit_tests():
         llm.find_websites = original
     check(took < 1 and "Website lookup failed: timed out after 0.2s" in out["source_notes"] and out["leads"],
           "finder: website lookup is bounded by the web-search timeout too")
+
+
+async def finder_budget_tests():
+    """Live: find_leads hung >10 min. Now one deadline (FINDER_BUDGET_S): slow sources/verification -> partial leads."""
+    slow_lead = {"name": "Slow Site Cafe", "website": "https://slowsite.test", "area": None,
+                 "evidence_url": "https://search.example/slowsite"}
+
+    async def fast_search(icp, query):
+        return [slow_lead]
+
+    async def slow_osm(tags, bbox):
+        await asyncio.sleep(5)
+        return []
+
+    class SlowFetcher(FakeFetcher):
+        async def fetch(self, url):
+            await asyncio.sleep(5)
+            return await super().fetch(url)
+
+    capture = LogCapture()
+    capture.setLevel(logging.INFO)
+    lead_finder.log.addHandler(capture)
+    saved = lead_finder.FINDER_BUDGET_S, lead_finder.VERIFY_RESERVE_S
+    lead_finder.FINDER_BUDGET_S, lead_finder.VERIFY_RESERVE_S = 0.6, 0.3
+    geo.find_businesses, lead_finder.PoliteFetcher = slow_osm, SlowFetcher
+    try:
+        out, took = await _find_with(fast_search, ["q1"])
+    finally:
+        geo.find_businesses, lead_finder.PoliteFetcher = fake_find_businesses, FakeFetcher
+        lead_finder.FINDER_BUDGET_S, lead_finder.VERIFY_RESERVE_S = saved
+        lead_finder.log.removeHandler(capture)
+    lead = next((x for x in out["leads"] if x["name"] == "Slow Site Cafe"), {})
+    check(took < 1.2 and lead.get("verified") is False and lead.get("website") == "https://slowsite.test"
+          and any("1 unverified (time budget)" in n for n in out["source_notes"])
+          and any(n.startswith("OpenStreetMap failed (timed out") for n in out["source_notes"]),
+          f"finder: over budget -> partial leads, unchecked site kept as verified=false, no error ({took:.2f}s)")
+    phases = [line.split(":")[0] for line in capture.lines if line.startswith("find_leads ")]
+    check(phases == ["find_leads osm", "find_leads web_search", "find_leads verify", "find_leads done"],
+          f"finder: one INFO log line per phase: osm, web_search, verify, done ({phases})")
+    row = orchestrator.lead_rows([lead])[0]["value"]
+    check("slowsite.test (unverified)" in row, f"leads card marks an unverified website ({row})")
+
+    async def nothing(*_a, **_k):
+        return []
+
+    import common
+
+    geo.find_businesses = nothing
+    try:
+        llm.discover_businesses, saved_discover = nothing, llm.discover_businesses
+        answer = common.tool_runner({"find_leads": lead_finder.find_leads})
+        reply = await answer(common.ToolRequest(tool="find_leads", args_json=json.dumps({"icp": ICP, "limit": 5})),
+                             logging.getLogger("mock-finder"))
+    finally:
+        geo.find_businesses, llm.discover_businesses = fake_find_businesses, saved_discover
+    check(reply.ok is False and "no leads found" in reply.error,
+          f"finder: zero leads -> error ToolResponse ({reply.error[:80]})")
+
+
+async def dedupe_request_tests():
+    import common
+
+    calls: list[dict] = []
+
+    async def work(args):
+        calls.append(args)
+        await asyncio.sleep(0.1)
+        return {"n": len(calls)}
+
+    capture = LogCapture()
+    capture.setLevel(logging.INFO)
+    logger = logging.getLogger("mock-dedupe")
+    logger.setLevel(logging.INFO)
+    logger.addHandler(capture)
+    logger.propagate = False
+    answer = common.tool_runner({"work": work})
+    req = common.ToolRequest(tool="work", args_json=json.dumps({"x": 1, "_request_id": "abcdef0123456789"}))
+    first, second = await asyncio.gather(answer(req, logger), answer(req, logger))
+    third = await answer(req, logger)
+    fresh = await answer(common.ToolRequest(tool="work", args_json=json.dumps({"x": 1, "_request_id": "ffff"})), logger)
+    check(first.ok and first == second == third and json.loads(first.result) == {"n": 1}
+          and calls[0] == {"x": 1} and json.loads(fresh.result) == {"n": 2} and len(calls) == 2
+          and sum(line == "dedupe hit abcdef01" for line in capture.lines) == 2,
+          f"specialist: duplicate _request_id -> tool runs once, both get the result (cached after); "
+          f"tools never see the id ({len(calls)} runs, {capture.lines})")
 
 
 async def banned_osm_website_test():
@@ -446,17 +537,32 @@ def timeout_unit_tests():
         os.environ.pop(key, None)
         if saved is not None:
             os.environ[key] = saved
-    check(seen == {None: 300, "450": 450, "abc": 300, "0": 300},
-          f"orchestrator: find_leads timeout 300 s by default, LEADREACH_TIMEOUT_FIND_LEADS overrides it ({seen})")
-    check({t: d for t, (_, d) in orchestrator.SPECIALISTS.items()} ==
-          {"find_leads": 300, "find_contacts": 90, "qualify_leads": 120, "draft_emails": 240, "send_emails": 60},
-          "orchestrator: default specialist timeouts sized for live web search + crawling")
-    check(contact_finder.CONTACT_BUDGET_S == 50 < orchestrator.SPECIALISTS["find_contacts"][1]
-          and lead_analyst.ANALYST_BUDGET_S == 90 < orchestrator.SPECIALISTS["qualify_leads"][1]
+    check(seen == {None: 60, "450": 450, "abc": 60, "0": 60},
+          f"orchestrator: find_leads wait 60 s by default, LEADREACH_TIMEOUT_FIND_LEADS overrides it ({seen})")
+    waits = {t: d for t, (_, d) in orchestrator.SPECIALISTS.items()}
+    check(waits == {"find_leads": 60, "find_contacts": 60, "qualify_leads": 70, "draft_emails": 60, "send_emails": 30}
+          and orchestrator.RESEND_WAIT_S == 30 and orchestrator.STEP_WORST_S == 180,
+          "orchestrator: primary waits 60/60/70/60/30 s, resend wait 30 s, step worst case 180 s")
+    check(contact_finder.CONTACT_BUDGET_S == 50 < waits["find_contacts"]
+          and lead_analyst.ANALYST_BUDGET_S == 60 < waits["qualify_leads"]
+          and lead_finder.FINDER_BUDGET_S == 50 < waits["find_leads"]
           and contact_finder.MAX_PAGES == 3 and contact_finder.MX_TIMEOUT_S == 5,
-          "contacts/analyst: own budgets (50 s / 90 s) stay below the orchestrator timeouts; 3 pages per site, 5 s MX")
-    check(lead_finder.WEB_SEARCH_TIMEOUT_S * 2 + 60 < orchestrator.SPECIALISTS["find_leads"][1],
-          "finder: discovery + website lookup + verification fit inside the find_leads timeout")
+          "finder/contacts/analyst: own budgets (50/50/60 s) stay below the primary waits; 3 pages per site, 5 s MX")
+    local = {"find_leads": lead_finder.FINDER_BUDGET_S, "find_contacts": contact_finder.CONTACT_BUDGET_S,
+             "qualify_leads": lead_analyst.ANALYST_BUDGET_S, "draft_emails": 2 * copywriter.LLM_TIMEOUT_S, "send_emails": 1}
+    check(all(waits[t] + orchestrator.RESEND_WAIT_S + local[t] <= orchestrator.STEP_WORST_S for t in waits),
+          "orchestrator: every step's primary wait + resend wait + local run fits 180 s")
+    check(llm.LLM_TIMEOUT_S == 20 and llm.LLM_MAX_RETRIES == 1 and lead_finder.MAX_QUERIES == 2
+          and lead_finder.MAX_VERIFY == 8 and lead_finder.VERIFY_TIMEOUT_S == 10 and geo.HTTP_TIMEOUT_S == 10
+          and "[timeout:10]" in geo._overpass_query(["amenity=cafe"], [1, 2, 3, 4]),
+          "llm: 20 s per request + 1 retry; finder: 2 web searches, ≤8 sites verified, 10 s HTTP timeouts (Overpass too)")
+    real_client, llm._client = llm._client, None
+    try:
+        c = llm.client()
+        check(c.timeout == 20 and c.max_retries == 1,
+              f"llm: AsyncOpenAI timeout=20, max_retries=1 ({c.timeout}, {c.max_retries})")
+    finally:
+        llm._client = real_client
 
 
 class FakeCompletions:
@@ -877,10 +983,10 @@ async def copywriter_live_fix_tests(args: dict):
     finally:
         copywriter.LLM_TIMEOUT_S = saved_timeout
         copywriter.log.removeHandler(capture)
-    check(copywriter.LLM_TIMEOUT_S >= 60 and copywriter.DRAFT_CONCURRENCY >= lead_finder.MAX_LIMIT
-          and copywriter.LLM_TIMEOUT_S * 2 < orchestrator.SPECIALISTS["draft_emails"][1],
+    check(copywriter.LLM_TIMEOUT_S >= 40 and copywriter.DRAFT_CONCURRENCY >= lead_finder.MAX_LIMIT
+          and copywriter.LLM_TIMEOUT_S * 2 < orchestrator.SPECIALISTS["draft_emails"][1] + orchestrator.RESEND_WAIT_S,
           f"copywriter: per-call LLM timeout ({copywriter.LLM_TIMEOUT_S:g}s) fits a live call; one wave x 2 attempts "
-          "fits the draft_emails timeout")
+          "fits the draft_emails wait + resend")
 
     seen: dict = {}
 
@@ -1396,22 +1502,53 @@ async def orchestrator_live_fix_tests():
               "orchestrator: mention-prefixed 'buy lead pack' after contacts -> RequestPayment, state untouched")
 
         ok = ToolResponse(ok=True, result=json.dumps({"contacts": ready["contacts"], "skipped": []}))
-        tctx = FakeToolCtx([(None, "timeout"), (ok, "delivered")])
+        local_calls: list[dict] = []
+
+        async def local_contacts(args):
+            local_calls.append(args)
+            return {"contacts": ready["contacts"], "skipped": []}
+
+        async def broken_local(args):
+            raise RuntimeError("crawler down")
+
+        def sent_args(req) -> tuple[str, dict]:
+            data = json.loads(req.args_json)
+            return data.pop("_request_id", ""), data
+
+        capture = LogCapture()
+        tctx = FakeToolCtx([(None, "timeout"), (None, "timeout")])
+        tctx.logger.addHandler(capture)
+        contact_finder.find_contacts, saved_find = local_contacts, contact_finder.find_contacts
+        c = dict(no_contacts, log=[], icp=ICP)
+        await orchestrator.dispatch(tctx, buyer, c, {"intent": "approve", "args": {}})
+        (rid1, args1), (rid2, args2) = (sent_args(r[1]) for r in tctx.requests)
+        check(len(tctx.requests) == 2 and len(rid1) == 32 and rid1 == rid2 and args1 == args2
+              and tctx.requests[0][2] == orchestrator.tool_timeout("find_contacts")
+              and tctx.requests[1][2] == orchestrator.RESEND_WAIT_S,
+              "orchestrator: no response -> one resend with the same _request_id (waits 60 s, then 30 s)")
+        check(len(local_calls) == 1 and local_calls[0] == args1 and "_request_id" not in local_calls[0]
+              and any(line.startswith("fallback: local find_contacts") for line in capture.lines)
+              and c["state"] == st.AWAIT_CONTACTS and len(c["contacts"]) == 1,
+              f"orchestrator: still nothing -> 'fallback: local find_contacts' runs in-process and the flow continues "
+              f"({c['state']}, {capture.lines[-2:]})")
+
+        contact_finder.find_contacts = broken_local
+        tctx = FakeToolCtx([(None, "timeout"), (None, "timeout"), (ok, "delivered")])
         c = dict(no_contacts, log=[], icp=ICP)
         await orchestrator.dispatch(tctx, buyer, c, {"intent": "approve", "args": {}})
         check(c["state"] == st.STEP_FAILED and c["failed_gate"] == "contacts"
               and text_of(tctx.sent[-1][1]) ==
-              "⚠ Contact Finder timed out — reply **retry** to try again, or **skip** to move on."
-              and tctx.requests[0][2] == orchestrator.tool_timeout("find_contacts"),
-              f"orchestrator: specialist timeout -> STEP_FAILED + 'Contact Finder timed out — reply retry' "
+              "⚠ Contact Finder timed out — reply **retry** to try again, or **skip** to move on.",
+              f"orchestrator: local fallback fails -> STEP_FAILED + 'Contact Finder timed out — reply retry' "
               f"({text_of(tctx.sent[-1][1])})")
         await orchestrator.dispatch(tctx, buyer, c, await orchestrator.understand(f"{mention} retry", c))
-        first, second = (r[1] for r in tctx.requests)
-        check(len(tctx.requests) == 2 and first.tool == second.tool == "find_contacts"
-              and first.args_json == second.args_json and c["state"] == st.AWAIT_CONTACTS and len(c["contacts"]) == 1,
-              "orchestrator: 'retry' after a timeout re-sends the same find_contacts request and recovers")
+        (rid1, args1), _, (rid3, args3) = (sent_args(r[1]) for r in tctx.requests)
+        check(len(tctx.requests) == 3 and tctx.requests[2][1].tool == "find_contacts" and rid3 != rid1
+              and args3 == args1 and c["state"] == st.AWAIT_CONTACTS and len(c["contacts"]) == 1,
+              "orchestrator: 'retry' re-sends the step with a new _request_id and recovers")
     finally:
         llm.parse_intent = saved_parse
+        contact_finder.find_contacts = saved_find
 
 
 _saved_recipient = os.environ.pop("LEADPACK_RECIPIENT", None)  # the payment checks expect the default recipient

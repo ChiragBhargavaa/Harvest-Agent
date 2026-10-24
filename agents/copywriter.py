@@ -28,8 +28,9 @@ NAME = "leadreach-writer"
 log = logging.getLogger(NAME)  # the agent's own logger (uAgents names it after the agent)
 DRAFT_CONCURRENCY = 15  # = the ≤15 leads per request (§3.6): one wave
 # A live ASI:One draft call can take 30+ s, and an in-flight call cancelled by this timeout is never logged by
-# httpx. One wave x 2 attempts x 100 s stays inside the orchestrator's 240 s draft_emails timeout.
-LLM_TIMEOUT_S = env_seconds("LEADREACH_DRAFT_LLM_TIMEOUT", 100)
+# httpx. One wave x 2 attempts x 40 s = 80 s fits the orchestrator's 60 s wait + 30 s resend (deduped, same run),
+# and a local fallback run fits the 180 s step worst case (HACKATHON_README §3.6).
+LLM_TIMEOUT_S = env_seconds("LEADREACH_DRAFT_LLM_TIMEOUT", 40)
 DEFAULT_MAX_WORDS = 150  # same default as llm.draft_email
 MAX_SUBJECT_WORDS, MAX_SUBJECT_CHARS = 8, 60
 MIN_HOOK_MATCH_CHARS = 10

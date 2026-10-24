@@ -6,7 +6,7 @@ Hooks are kept only if their evidence snippet really appears on a crawled page (
 the evidence_url is set to the page it was found on. If the LLM fails (error, timeout, bad JSON, missing keys) the
 lead gets a deterministic signals-only review with `fallback: true`. Leads without a usable website get a
 signals-only review with `reachable: false` and an `unreachable_reason` (no LLM call: there is no evidence).
-The whole step gets ANALYST_BUDGET_S (env, default 90 s; the orchestrator waits 120 s): leads still being reviewed then
+The whole step gets ANALYST_BUDGET_S (env, default 60 s; the orchestrator waits 70 s): leads still being reviewed then
 are cancelled and get a minimal review (fit 0 = unknown, no hooks, `unreachable_reason: "timed_out"`, "Review timed out")
 so the flow continues with a partial result, never an error.
 
@@ -57,8 +57,8 @@ log = logging.getLogger(NAME)  # the agent's own logger (uAgents names it after 
 CRAWL_CONCURRENCY = 5
 MAX_PAGES = 5
 MAX_HOOKS = 3
-LLM_TIMEOUT_S = 60  # per lead; the step as a whole is capped by ANALYST_BUDGET_S
-ANALYST_BUDGET_S = env_seconds("ANALYST_BUDGET_S", 90)  # stays below the orchestrator's 120 s qualify_leads timeout
+LLM_TIMEOUT_S = 45  # per lead, inside the step budget (a slow LLM falls back to signals); step capped by ANALYST_BUDGET_S
+ANALYST_BUDGET_S = env_seconds("ANALYST_BUDGET_S", 60)  # stays below the orchestrator's 70 s qualify_leads wait
 PAGE_TEXT_CHARS = 4000  # what llm.qualify sends
 MIN_EVIDENCE_CHARS = 10
 STOPWORDS = {"the", "and", "with", "for", "that", "has", "have", "are", "its", "their", "from", "into", "offers",

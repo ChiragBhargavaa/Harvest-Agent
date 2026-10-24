@@ -240,10 +240,17 @@ class ToolResponse(Model):
 `reply, status = await ctx.send_and_receive(addr, ToolRequest(...), response_type=ToolResponse, timeout=T)` — ✅ verified in
 `agents/mock_test.py`; `reply` is `None` on timeout.
 
-**Per-tool timeouts (s):** `find_leads` 300 · `find_contacts` 90 · `qualify_leads` 120 · `draft_emails` 240 · `send_emails` 60
-(sized for live web search + polite crawling; override with `LEADREACH_TIMEOUT_<TOOL>`, §3.16). The progress text is sent
-before the call. On a timeout the user sees "⚠ <Specialist> timed out — reply **retry** …" (`STEP_FAILED`; **retry** re-sends
-the same request, **skip** moves on). ASI:One prefixes user text with "@agent1… ": the orchestrator strips it before intent
+**Per-tool primary waits (s):** `find_leads` 60 · `find_contacts` 60 · `qualify_leads` 70 · `draft_emails` 60 · `send_emails` 30
+(override with `LEADREACH_TIMEOUT_<TOOL>`, §3.16). The progress text is sent before the call. **Request ids + fallback**
+(live 24 Oct 2026: `find_leads` hung >10 min with no reply and no error): each step's `args_json` carries `"_request_id"`
+(uuid4 hex; the `ToolRequest`/`ToolResponse` schema is unchanged and tools never see it). No reply within the primary wait →
+the orchestrator resends **once** with the same `_request_id` and waits `RESEND_WAIT_S` (30 s); `make_specialist`
+(`common.tool_runner`) remembers the last 100 ids, so a duplicate awaits the in-flight run or gets its cached reply
+("dedupe hit <id8>"). Still nothing → the orchestrator runs the specialist's tool function in-process ("fallback: local
+<tool>", same args; the sender stays a dry-run shell) and continues with its result. Worst case per step (primary + resend
++ local run, capped at what is left) ≤ 180 s. Each send/arrival is logged (tool, id8, seconds, status). If the local run
+fails too, the user sees "⚠ <Specialist> timed out — reply **retry** …" (`STEP_FAILED`; **retry** re-sends the step with a
+new `_request_id`, **skip** moves on). ASI:One prefixes user text with "@agent1… ": the orchestrator strips it before intent
 matching, and any text containing "lead pack" / "buy pack" is `buy_lead_pack` without an LLM call. Send **≤15 leads per request**.
 
 ### 3.7 Tool args and result schemas
@@ -254,9 +261,14 @@ matching, and any text containing "lead pack" / "buy pack" is `buy_lead_pack` wi
 // result
 {"leads": [Lead], "call_list": [Lead], "source_notes": ["OpenStreetMap: 86 businesses ...; 8 list a website."], "city": "Jaipur, ..."}
 ```
-The ≤3 `search_queries` run `llm.discover_businesses` **concurrently** and are merged in query order. Every web-search call
-(`discover_businesses`, `find_websites`) is bounded by `LEADREACH_WEB_SEARCH_TIMEOUT` (default 90 s); a failed or timed-out
-query becomes a `source_notes` entry ("Web search failed for '<query>': ..."), never a step failure.
+The whole step has a `FINDER_BUDGET_S` deadline (default 50 s). OSM (Nominatim + Overpass, 10 s per HTTP request,
+Overpass `[timeout:10]`) and the ≤2 `search_queries` (`llm.discover_businesses`) run **concurrently** (results merged in
+query order), then at most 1 `find_websites` batch call, keeping 12 s for verification. Every web-search call is also bounded
+by `LEADREACH_WEB_SEARCH_TIMEOUT` (default 90 s); a failed or timed-out source becomes a `source_notes` entry ("Web search
+failed for '<query>': ...", "OpenStreetMap failed (...)"), never a step failure. At most 8 candidate websites are verified,
+concurrently, 10 s per fetch; candidates not checked by the deadline stay with `"verified": false` (card: "(unverified)",
+note "N unverified (time budget)"): a partial result, never an error. **Zero leads** (no lead and no phone-only business)
+→ error `ToolResponse`. One INFO log line per phase: `find_leads osm|web_search|verify|done` with counts + seconds.
 An OSM `website`/`contact:website` tag on a banned host (§3.13, e.g. a zomato.com page) is treated as no website: it is
 never shown or crawled, and a `source_notes` entry counts them.
 After website verification, `dedupe_leads` keeps the best-ranked lead per website domain (`www.`/scheme/path ignored) or
@@ -284,7 +296,7 @@ plus `pages_crawled`) → `llm.qualify` (60 s timeout). A hook is kept only if i
 LLM failure (error, timeout, bad JSON, missing/invalid `fit_score` or `hooks`) → deterministic signals-only review,
 `fallback: true`, no hooks. No website or failed crawl → `reachable: false` + `unreachable_reason`
 (`no_website|banned_host|robots_disallowed|unreachable`), signals-only, no LLM call. `contacts` is accepted but not used yet.
-The step has an `ANALYST_BUDGET_S` budget (default 90 s): unfinished leads get a minimal review (`fit_score` 0 = unknown,
+The step has an `ANALYST_BUDGET_S` budget (default 60 s; `llm.qualify` 45 s per lead): unfinished leads get a minimal review (`fit_score` 0 = unknown,
 no hooks, `unreachable_reason: "timed_out"`, summary "Review timed out; fit unknown.", `fallback: true`).
 **`draft_emails`** ✅ implemented (M4)
 ```jsonc
@@ -295,8 +307,8 @@ no hooks, `unreachable_reason: "timed_out"`, summary "Review timed out; fit unkn
 One draft per lead that has a contact, addressed to its first (= primary, §3.7 `find_contacts` sort) contact; sorted best
 fit first. Contact confidence doesn't matter here: low-confidence contacts get drafts too (their explicit approval is a
 send-time invariant, §3.4). Leads are drafted concurrently (≤15 at a time = one wave), `llm.draft_email(..., product=
-icp.product, brief=brief)` with a `LEADREACH_DRAFT_LLM_TIMEOUT` (default 100 s) timeout per attempt (2 attempts fit the
-240 s `draft_emails` timeout), then the validator (§3.12). A lead with no contact, or whose first LLM call fails (error,
+icp.product, brief=brief)` with a `LEADREACH_DRAFT_LLM_TIMEOUT` (default 40 s) timeout per attempt (2 attempts = 80 s fit the
+60 s `draft_emails` wait + 30 s deduped resend), then the validator (§3.12). A lead with no contact, or whose first LLM call fails (error,
 timeout, bad JSON), goes to `skipped`: the copywriter never writes a draft without the LLM. `detail` says why (e.g.
 "timed out after 100s"; secrets redacted) and both the copywriter and the orchestrator log it as a warning. (Live
 24 Oct 2026: a 25 s timeout cancelled 2 of 3 calls in flight; httpx logs a request only once it is answered, so no
@@ -317,7 +329,8 @@ draft card.
 // Lead
 {"id": "osm:node/123 | web:<slug> | manual:<slug>", "name": "...", "category": "amenity=cafe | null", "address": null,
  "lat": null, "lon": null, "website": "https://... | null", "website_source": "osm | web_verified | null",
- "osm_emails": [], "phone": null, "source": "osm | web | manual", "source_ref": "https://www.openstreetmap.org/node/123 | <search result URL>"}
+ "osm_emails": [], "phone": null, "source": "osm | web | manual", "source_ref": "https://www.openstreetmap.org/node/123 | <search result URL>",
+ "verified": "true (web_verified) | false (candidate not crawled within FINDER_BUDGET_S; website_source web_candidate) | absent"}
 
 // Contact
 {"lead_id": "...", "email": "hello@cafe.in", "role": "owner|manager|sales|orders|info|contact|unknown", "person_name": null,
@@ -474,7 +487,8 @@ latest year seen, keyword flags (online ordering, menu, events, catering), app-s
 ### 3.15 Reliability rules
 - Every external call has a timeout; transient errors go through `with_retry`.
 - Specialist timeouts must cover the live worst case: a live ASI:One web-search call takes ~30-60 s, so the lead finder runs
-  its queries concurrently and caps each at `LEADREACH_WEB_SEARCH_TIMEOUT`, and the orchestrator waits up to
+  its queries concurrently inside `FINDER_BUDGET_S`, every ASI:One HTTP request has `LEADREACH_LLM_TIMEOUT` (20 s) and 1 SDK
+  retry (the SDK default of 600 s + 2 retries hung a live run), and the orchestrator waits up to
   `LEADREACH_TIMEOUT_<TOOL>` (§3.6). A reply that arrives after the orchestrator's timeout is dropped by uAgents
   ("unrecognized schema digest"), so keep each specialist's own budget below its orchestrator timeout.
 - Partial success is fine (e.g. OSM down → web-search leads; web search down → OSM leads). Report what's missing and why
@@ -495,10 +509,12 @@ latest year seen, keyword flags (online ordering, menu, events, catering), app-s
 | `LEAD_FINDER_AGENT_ADDRESS`, `CONTACT_FINDER_AGENT_ADDRESS`, `LEAD_ANALYST_AGENT_ADDRESS`, `COPYWRITER_AGENT_ADDRESS`, `SENDER_AGENT_ADDRESS` | Derived: `Identity.from_seed(seed, 0).address` ✅ |
 | `FOURSQUARE_API_KEY`, `GOOGLE_PLACES_API_KEY` | Optional extra lead sources (unused unless set) |
 | `MAILBOX`, `OWNER_MODE`, `*_PORT` | Runtime (tests force `MAILBOX=false`) |
-| `LEADREACH_TIMEOUT_FIND_LEADS`, `_FIND_CONTACTS`, `_QUALIFY_LEADS`, `_DRAFT_EMAILS`, `_SEND_EMAILS` | Optional: seconds the orchestrator waits for each specialist (defaults 300/90/120/240/60; invalid or ≤0 → default) |
-| `CONTACT_BUDGET_S`, `ANALYST_BUDGET_S` | Optional: seconds the contact finder / lead analyst work before returning a partial result (defaults 50 / 90) |
+| `LEADREACH_TIMEOUT_FIND_LEADS`, `_FIND_CONTACTS`, `_QUALIFY_LEADS`, `_DRAFT_EMAILS`, `_SEND_EMAILS` | Optional: seconds the orchestrator waits for each specialist (defaults 60/60/70/60/30; invalid or ≤0 → default) |
+| `RESEND_WAIT_S` | Optional: seconds the orchestrator waits after its one resend before the local fallback (default 30) |
+| `LEADREACH_LLM_TIMEOUT` | Optional: seconds per ASI:One HTTP request (default 20; `max_retries=1`) |
+| `FINDER_BUDGET_S`, `CONTACT_BUDGET_S`, `ANALYST_BUDGET_S` | Optional: seconds the lead finder / contact finder / lead analyst work before returning a partial result (defaults 50 / 50 / 60) |
 | `LEADREACH_WEB_SEARCH_TIMEOUT` | Optional: seconds per lead-finder web-search call (default 90) |
-| `LEADREACH_DRAFT_LLM_TIMEOUT` | Optional: seconds per copywriter `llm.draft_email` attempt (default 100; invalid or ≤0 → default) |
+| `LEADREACH_DRAFT_LLM_TIMEOUT` | Optional: seconds per copywriter `llm.draft_email` attempt (default 40; invalid or ≤0 → default) |
 | `RESEND_API_KEY`, `SENDER_FROM`, `REPLY_TO`, `DRY_RUN`, `TEST_REDIRECT_TO`, `DAILY_CAP` | Sending + safety defaults |
 
 ### 3.17 File layout
@@ -528,7 +544,7 @@ Shared modules are fine for mailbox agents run from this repo. If an agent moves
 helpers into one file (§4.7).
 
 ### 3.18 Milestones and acceptance tests
-**Mock test** ✅ (`agents/mock_test.py`, 150 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
+**Mock test** ✅ (`agents/mock_test.py`, 159 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
 fetcher and `mx_ok` are monkeypatched; all agents + a scripted user run in a `Bureau(port=8010)`; exit code 0 = pass.
 
 | Milestone | Done when |
@@ -777,7 +793,7 @@ agent.include(pay_proto, publish_manifest=True)
 ---
 
 ## 5. Repo state (24 Oct 2026)
-- **Feature freeze for the submission:** M0–M4 done; M5 and M6 out of scope. `agents/mock_test.py` passes (**150 checks**) ✅;
+- **Feature freeze for the submission:** M0–M4 done; M5 and M6 out of scope. `agents/mock_test.py` passes (**159 checks**) ✅;
   `ruff check agents scripts` is clean.
 - **Implemented (5 of 6 agents):**
   - orchestrator: intent, ICP, gates, cards, pause/resume, settings, retry/skip, audit log, `edit_draft` (per-draft edits;

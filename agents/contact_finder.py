@@ -10,8 +10,8 @@ Confidence (HACKATHON_README §3.8):
            (e.g. the web designer's) that appears on the business's site.
 Emails whose domain has no MX/A record are dropped. Leads with no usable email go to `skipped` with a reason.
 
-Time limits (the orchestrator waits 90 s): each MX lookup gets MX_TIMEOUT_S (5 s); on timeout the email is kept with
-`mx_ok: null` (unverified) and its confidence lowered one level (high -> medium -> low). The whole step gets
+Time limits (the orchestrator waits 60 s, then resends once): each MX lookup gets MX_TIMEOUT_S (5 s); on timeout the
+email is kept with `mx_ok: null` (unverified) and its confidence lowered one level (high -> medium -> low). The whole step gets
 CONTACT_BUDGET_S (env, default 50 s): leads still running then are cancelled and go to `skipped` with reason
 "timed_out"; the partial result is returned, never an error.
 
@@ -42,7 +42,7 @@ NAME = "leadreach-contacts"
 log = logging.getLogger(NAME)  # the agent's own logger (uAgents names it after the agent)
 CRAWL_CONCURRENCY = 5
 MAX_PAGES = 3
-CONTACT_BUDGET_S = env_seconds("CONTACT_BUDGET_S", 50)  # whole step; stays below the orchestrator's 90 s
+CONTACT_BUDGET_S = env_seconds("CONTACT_BUDGET_S", 50)  # whole step; stays below the orchestrator's 60 s wait
 MX_TIMEOUT_S = 5
 CONFIDENCES = ["high", "medium", "low"]
 # crawl.guess_role -> Contact.role (§3.8)

@@ -16,6 +16,7 @@ from crawl import USER_AGENT
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OVERPASS_URLS = ("https://overpass-api.de/api/interpreter", "https://overpass.private.coffee/api/interpreter")
 CACHE_TTL_S = 24 * 3600
+HTTP_TIMEOUT_S = 10  # per request; the lead finder has a 50 s budget for the whole step
 _cache: dict[str, tuple[float, object]] = {}
 _lock = asyncio.Lock()  # one OSM request at a time from this process
 
@@ -55,7 +56,7 @@ async def geocode(city: str, country: str = "India") -> dict:
         return hit
     async with _lock, aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as s:
         params = {"q": f"{city}, {country}", "format": "json", "limit": 1}
-        async with s.get(NOMINATIM_URL, params=params, timeout=aiohttp.ClientTimeout(total=20)) as r:
+        async with s.get(NOMINATIM_URL, params=params, timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT_S)) as r:
             r.raise_for_status()
             data = await r.json()
         await asyncio.sleep(1)  # Nominatim: max 1 request per second
@@ -71,7 +72,7 @@ async def geocode(city: str, country: str = "India") -> dict:
 def _overpass_query(tags: list[str], bbox: list[float]) -> str:
     s, n, w, e = bbox
     parts = "".join(f'nwr["{k}"="{v}"]["name"]({s},{w},{n},{e});' for k, v in (t.split("=", 1) for t in tags))
-    return f"[out:json][timeout:60];({parts});out center tags;"
+    return f"[out:json][timeout:{HTTP_TIMEOUT_S}];({parts});out center tags;"
 
 
 async def find_businesses(tags: list[str], bbox: list[float]) -> list[dict]:
@@ -85,7 +86,7 @@ async def find_businesses(tags: list[str], bbox: list[float]) -> list[dict]:
     async with _lock, aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as s:
         for url in OVERPASS_URLS:
             try:
-                async with s.post(url, data={"data": query}, timeout=aiohttp.ClientTimeout(total=90)) as r:
+                async with s.post(url, data={"data": query}, timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT_S)) as r:
                     if r.status in (429, 504):
                         last_err = RuntimeError(f"Overpass busy ({r.status})")
                         await asyncio.sleep(30)

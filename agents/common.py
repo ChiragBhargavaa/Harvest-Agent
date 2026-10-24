@@ -120,6 +120,50 @@ async def with_retry(fn, *args, attempts: int = 3, base_delay: float = 1.0, **kw
 # ---------- specialist factory ----------
 
 ToolFn = Callable[[dict], Awaitable[dict]]
+REQUEST_ID_KEY = "_request_id"  # in args_json: one uuid4 hex per logical step; a resend reuses it (tools never see it)
+MAX_REMEMBERED_REQUESTS = 100
+
+
+def tool_runner(tools: dict[str, ToolFn]) -> Callable[[ToolRequest, object], Awaitable[ToolResponse]]:
+    """-> answer(req, logger) -> ToolResponse. Never raises. A request whose `_request_id` was seen before awaits the
+    in-flight run (or returns its cached reply) instead of redoing the work; the last 100 ids are remembered."""
+    runs: dict[str, asyncio.Future] = {}
+
+    async def run(req: ToolRequest, args: dict, logger) -> ToolResponse:
+        fn = tools.get(req.tool)
+        if fn is None:
+            return ToolResponse(ok=False, error=f"unknown tool '{req.tool}'")
+        start = time.monotonic()
+        try:
+            result = await fn(args)
+            logger.info(f"{req.tool} done in {time.monotonic() - start:.1f}s")
+            return ToolResponse(ok=True, result=json.dumps(result))
+        except NotImplementedError as err:
+            logger.warning(str(err))
+            return ToolResponse(ok=False, error=str(err))
+        except Exception as err:  # noqa: BLE001 - report every failure back to the orchestrator
+            error = redact(f"{type(err).__name__}: {err}")[:400]
+            logger.error(f"{req.tool} failed in {time.monotonic() - start:.1f}s: {error}")
+            return ToolResponse(ok=False, error=error)
+
+    async def answer(req: ToolRequest, logger) -> ToolResponse:
+        try:
+            args = json.loads(req.args_json or "{}")
+        except ValueError as err:
+            return ToolResponse(ok=False, error=f"invalid args_json: {err}")
+        rid = str(args.pop(REQUEST_ID_KEY, "") or "") if isinstance(args, dict) else ""
+        task = runs.get(rid) if rid else None
+        if task is not None:
+            logger.info(f"dedupe hit {rid[:8]}")
+        else:
+            task = asyncio.ensure_future(run(req, args, logger))
+            if rid:
+                runs[rid] = task
+                while len(runs) > MAX_REMEMBERED_REQUESTS:
+                    runs.pop(next(iter(runs)))
+        return await asyncio.shield(task)  # a cancelled waiter never cancels the shared run
+
+    return answer
 
 
 def make_specialist(
@@ -136,6 +180,7 @@ def make_specialist(
 
     Each tool takes the parsed args dict and returns a JSON-serialisable result dict.
     Handlers never raise: unknown tools and exceptions come back as ToolResponse(ok=False).
+    Duplicate requests (same `_request_id`, e.g. the orchestrator's resend) share one run (`tool_runner`).
     """
     agent = Agent(
         name=name,
@@ -147,27 +192,16 @@ def make_specialist(
         readme_path=str(ROOT / "agents" / "profiles" / profile),
     )
     proto = Protocol(name="leadreach-tools", version="0.1.0")
+    answer = tool_runner(tools)
 
     @proto.on_message(ToolRequest, replies=ToolResponse)
     async def handle_request(ctx: Context, sender: str, req: ToolRequest):
         ctx.logger.info(f"{req.tool} request from {sender[:16]}...")
-        fn = tools.get(req.tool)
-        if fn is None:
-            await ctx.send(sender, ToolResponse(ok=False, error=f"unknown tool '{req.tool}'"))
-            return
-        start = time.monotonic()
         try:
-            args = json.loads(req.args_json or "{}")
-            result = await fn(args)
-            await ctx.send(sender, ToolResponse(ok=True, result=json.dumps(result)))
-            ctx.logger.info(f"{req.tool} done in {time.monotonic() - start:.1f}s")
-        except NotImplementedError as err:
-            ctx.logger.warning(str(err))
-            await ctx.send(sender, ToolResponse(ok=False, error=str(err)))
-        except Exception as err:  # noqa: BLE001 - report every failure back to the orchestrator
-            error = redact(f"{type(err).__name__}: {err}")[:400]
-            ctx.logger.error(f"{req.tool} failed in {time.monotonic() - start:.1f}s: {error}")
-            await ctx.send(sender, ToolResponse(ok=False, error=error))
+            reply = await answer(req, ctx.logger)
+        except Exception as err:  # noqa: BLE001 - e.g. the shared run was cancelled
+            reply = ToolResponse(ok=False, error=redact(f"{type(err).__name__}: {err}")[:400])
+        await ctx.send(sender, reply)
 
     agent.include(proto, publish_manifest=True)
 

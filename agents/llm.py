@@ -12,10 +12,13 @@ import re
 
 from openai import AsyncOpenAI
 
-from common import env_bool, require_env, with_retry
+from common import env_bool, env_seconds, require_env, with_retry
 
 ASI1_BASE_URL = "https://api.asi1.ai/v1"
 ASI1_MODEL = os.getenv("ASI1_MODEL", "asi1")
+# per HTTP request (the SDK default is 600 s + 2 retries, which hung a live find_leads for >10 min)
+LLM_TIMEOUT_S = env_seconds("LEADREACH_LLM_TIMEOUT", 20)
+LLM_MAX_RETRIES = 1
 
 _client: AsyncOpenAI | None = None
 
@@ -23,7 +26,8 @@ _client: AsyncOpenAI | None = None
 def client() -> AsyncOpenAI:
     global _client
     if _client is None:
-        _client = AsyncOpenAI(base_url=ASI1_BASE_URL, api_key=require_env("ASI1_API_KEY"))
+        _client = AsyncOpenAI(base_url=ASI1_BASE_URL, api_key=require_env("ASI1_API_KEY"),
+                              timeout=LLM_TIMEOUT_S, max_retries=LLM_MAX_RETRIES)
     return _client
 
 

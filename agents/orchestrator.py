@@ -10,10 +10,14 @@ Run:  python agents/orchestrator.py
 Then open the Agent Inspector link from the logs -> Connect -> Mailbox.
 """
 
+import asyncio
+import importlib
 import json
 import os
 import re
+import time
 from urllib.parse import urlparse
+from uuid import uuid4
 
 import yaml
 from uagents import Agent, Context, Protocol
@@ -23,18 +27,36 @@ import cards
 import llm
 import payments
 import state as st
-from common import ROOT, ToolRequest, ToolResponse, ack, chat_text, env_bool, env_seconds, redact, require_env, text_of
+from common import (
+    REQUEST_ID_KEY,
+    ROOT,
+    ToolRequest,
+    ToolResponse,
+    ack,
+    chat_text,
+    env_bool,
+    env_seconds,
+    redact,
+    require_env,
+    text_of,
+)
 
-# tool -> (env var with the specialist address, default timeout seconds; override with LEADREACH_TIMEOUT_<TOOL>)
-# Sized for live ASI:One web search (~30-60 s per call) plus polite crawling (1 request/s per site). The contact finder
-# and analyst cap their own work (CONTACT_BUDGET_S 50 s, ANALYST_BUDGET_S 90 s) and return partial results in time.
+# tool -> (env var with the specialist address, primary wait seconds; override with LEADREACH_TIMEOUT_<TOOL>)
+# Per step: wait the primary time; no reply -> resend ONCE with the same _request_id (the specialist dedupes it) and wait
+# RESEND_WAIT_S; still nothing -> run the specialist's tool in-process ("fallback: local <tool>"). Worst case per step
+# (primary + resend + local run) <= STEP_WORST_S: the specialists cap their own work (FINDER_BUDGET_S 50 s,
+# CONTACT_BUDGET_S 50 s, ANALYST_BUDGET_S 60 s, copywriter 2 x 40 s) and the local run gets what is left.
 SPECIALISTS = {
-    "find_leads": ("LEAD_FINDER_AGENT_ADDRESS", 300),
-    "find_contacts": ("CONTACT_FINDER_AGENT_ADDRESS", 90),
-    "qualify_leads": ("LEAD_ANALYST_AGENT_ADDRESS", 120),
-    "draft_emails": ("COPYWRITER_AGENT_ADDRESS", 240),
-    "send_emails": ("SENDER_AGENT_ADDRESS", 60),
+    "find_leads": ("LEAD_FINDER_AGENT_ADDRESS", 60),
+    "find_contacts": ("CONTACT_FINDER_AGENT_ADDRESS", 60),
+    "qualify_leads": ("LEAD_ANALYST_AGENT_ADDRESS", 70),
+    "draft_emails": ("COPYWRITER_AGENT_ADDRESS", 60),
+    "send_emails": ("SENDER_AGENT_ADDRESS", 30),
 }
+LOCAL_TOOLS = {"find_leads": "lead_finder", "find_contacts": "contact_finder", "qualify_leads": "lead_analyst",
+               "draft_emails": "copywriter", "send_emails": "sender"}  # tool -> module with `async def <tool>(args)`
+RESEND_WAIT_S = env_seconds("RESEND_WAIT_S", 30)
+STEP_WORST_S = 180
 SPECIALIST_NAMES = {"find_leads": "Lead Finder", "find_contacts": "Contact Finder", "qualify_leads": "Lead Analyst",
                     "draft_emails": "Copywriter", "send_emails": "Sender"}
 GATE_TOOL = {"leads": "find_leads", "contacts": "find_contacts", "reviews": "qualify_leads",
@@ -133,24 +155,44 @@ def tool_timeout(tool: str) -> float:
 
 
 async def call_tool(ctx: Context, tool: str, args: dict) -> tuple[dict | None, str]:
-    """-> (result, error). Never raises."""
+    """-> (result, error). Never raises. Send, resend once (same _request_id), then run the tool locally."""
     env_name, timeout = SPECIALISTS[tool][0], tool_timeout(tool)
+    name = SPECIALIST_NAMES[tool]
     address = os.getenv(env_name, "")
     if not address:
         return None, f"the {tool} agent address is not configured ({env_name})"
+    rid = uuid4().hex
+    req = ToolRequest(tool=tool, args_json=json.dumps({**args, REQUEST_ID_KEY: rid}))
+    start = time.monotonic()
+    for attempt, wait in (("send", timeout), ("resend", RESEND_WAIT_S)):
+        try:
+            reply, status = await ctx.send_and_receive(address, req, response_type=ToolResponse, timeout=wait)
+        except Exception as err:  # noqa: BLE001 - treated like no answer
+            reply, status = None, f"send error {redact(err)[:200]}"
+        took = time.monotonic() - start
+        if isinstance(reply, ToolResponse):
+            ctx.logger.info(f"{tool} {rid[:8]} response after {took:.1f}s ({attempt}, ok={reply.ok})")
+            if not reply.ok:
+                return None, reply.error or "unknown error"
+            try:
+                return json.loads(reply.result or "{}"), ""
+            except ValueError:
+                return None, f"the {tool} agent returned invalid JSON"
+        ctx.logger.warning(f"{tool} {rid[:8]} no response after {took:.1f}s ({attempt}, status {status})")
+
+    ctx.logger.warning(f"fallback: local {tool} ({rid[:8]})")
+    limit = max(1.0, STEP_WORST_S - timeout - RESEND_WAIT_S)
     try:
-        reply, status = await ctx.send_and_receive(
-            address, ToolRequest(tool=tool, args_json=json.dumps(args)), response_type=ToolResponse, timeout=timeout)
-    except Exception as err:  # noqa: BLE001
-        return None, f"could not reach the {tool} agent ({err})"
-    if not isinstance(reply, ToolResponse):
-        return None, f"{SPECIALIST_NAMES[tool]} timed out (no answer within {timeout:g}s, {status})"
-    if not reply.ok:
-        return None, reply.error or "unknown error"
-    try:
-        return json.loads(reply.result or "{}"), ""
-    except ValueError:
-        return None, f"the {tool} agent returned invalid JSON"
+        fn = getattr(importlib.import_module(LOCAL_TOOLS[tool]), tool)
+        result = await asyncio.wait_for(fn(json.loads(json.dumps(args))), limit)  # a copy, like the wire
+        result = json.loads(json.dumps(result))
+    except Exception as err:  # noqa: BLE001 - incl. the local time limit
+        why = (f"timed out after {limit:g}s" if isinstance(err, asyncio.TimeoutError)
+               else redact(f"{type(err).__name__}: {err}")[:200])
+        ctx.logger.error(f"fallback: local {tool} ({rid[:8]}) failed after {time.monotonic() - start:.1f}s: {why}")
+        return None, f"{name} timed out (no answer within {timeout:g}s + resend {RESEND_WAIT_S:g}s; local run: {why})"
+    ctx.logger.info(f"fallback: local {tool} ({rid[:8]}) done after {time.monotonic() - start:.1f}s")
+    return result, ""
 
 
 # ---------------- rendering ----------------
@@ -163,6 +205,8 @@ def lead_rows(leads: list[dict]) -> list[dict]:
     rows = []
     for i, lead in enumerate(leads, 1):
         bits = [_host(lead.get("website")) or "no website"]
+        if lead.get("website") and lead.get("verified") is False:
+            bits[0] += " (unverified)"
         if lead.get("osm_emails"):
             bits.append("email on OSM")
         if lead.get("phone"):
