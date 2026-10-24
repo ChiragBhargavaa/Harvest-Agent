@@ -1,0 +1,35 @@
+# Brand profile used for ICP building and email drafting.
+# Every value marked ❓ is unknown: fill it in yourself - the agents never invent brand facts.
+# A brand can also describe itself in chat; the chat brief overrides city/targets per campaign.
+brand:
+  name: "❓ brand name"
+  website: "❓ https://..."
+  sender_name: "❓ your name"
+  sender_role: "❓ e.g. Founder"
+  phone: "❓ optional"
+  city: "❓ home city"
+offer:
+  product: "❓ what you sell, e.g. organic single-origin coffee beans"
+  one_liner: "❓ one sentence value proposition"
+  value_props: ["❓", "❓"]
+ideal_customers:            # business types you want to reach and why they fit
+  - type: "❓ e.g. cafe"
+    why: "❓ e.g. they brew specialty coffee daily"
+social_proof:
+  customers_count: null     # ❓ number of existing customers (null = don't mention)
+  can_name_customers: false # ❓ only name customers with their permission
+  customer_names: []
+pricing:
+  mention_price: false      # ❓
+  price_note: ""
+cta:
+  text: "Would a 15-minute call or a free sample next week be useful?"
+  link: ""                  # optional calendar link
+email:
+  language: "English"       # English | Hindi | Hinglish
+  max_words: 140
+  unsubscribe_line: "If you'd prefer not to hear from me again, just reply 'unsubscribe'."
+targeting:
+  default_city: "❓ e.g. Jaipur"
+  radius_km: 10
+  batch_size: 15
