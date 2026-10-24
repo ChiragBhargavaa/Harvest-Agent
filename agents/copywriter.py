@@ -3,12 +3,13 @@
 Pipeline per lead (<=8 leads at a time): pick the lead's primary contact (contacts arrive sorted per lead) ->
 llm.draft_email(profile, lead, review, style_rules) -> validate(). Validator (HACKATHON_README §3.12): word count
 <= max_words; subject <= 8 words and <= 60 chars; the exact unsubscribe line; sender name + brand present; no
-{placeholders} or ❓; no price unless pricing.mention_price; hook_used matches one of the lead's review hooks.
-Also: no product claim (e.g. "single-origin", "fresh-roasted") that the brief, the ICP product, the filled-in
-profile facts and the lead's review don't contain. On failure regenerate once with the problems passed back; if it
-still fails, keep the draft with `warnings`. Leads without a contact, or whose LLM call fails, go to `skipped` (no
-draft is ever written without the LLM). Low-confidence contacts are drafted too: their approval is enforced at send
-time (§3.4).
+{placeholders} or ❓; no price/cost/discount words unless pricing.mention_price; no existing customers, "trusted by"
+or testimonials unless social_proof.can_name_customers with names or a count ("your customers" is fine);
+hook_used matches one of the lead's review hooks. Also: no product claim (e.g. "single-origin", "cordless") that
+the brief, the ICP product, the filled-in profile facts and the lead's review don't contain. On failure regenerate
+once with the problems passed back; if it still fails, keep the draft with `warnings`. Leads without a contact, or
+whose LLM call fails, go to `skipped` (no draft is ever written without the LLM). Low-confidence contacts are
+drafted too: their approval is enforced at send time (§3.4).
 
 Run:  python agents/copywriter.py
 """
@@ -35,8 +36,25 @@ CLAIM_TERMS = (
     "single origin", "fresh roasted", "freshly roasted", "small batch", "organic", "artisan", "artisanal",
     "handcrafted", "hand crafted", "handmade", "award winning", "certified", "fair trade", "ethically sourced",
     "sustainably sourced", "direct trade", "premium", "specialty grade", "locally roasted", "farm to cup", "wholesale",
+    # generic product-quality claims (e.g. for a trimmer)
+    "cordless", "waterproof", "long battery", "battery life", "professional grade", "salon grade", "precision",
+    "ergonomic", "lightweight", "light weight", "durable", "best in class", "fastest", "quietest", "warranty",
+    "guarantee", "guaranteed",
 )
-PRICE_RE = re.compile(r"₹\s*\d|\b(?:rs|inr|usd)\.?\s*\d|\$\s*\d|\d[\d,.]*\s*(?:/-|rupees\b|rs\b|inr\b)", re.I)
+PRICE_RE = re.compile(r"₹\s*\d|\b(?:rs|inr|usd)\.?\s*\d|\$\s*\d|\d[\d,.]*\s*(?:/-|rupees\b|rs\b|inr\b)"
+                      r"|\b(?:price[sd]?|pricing|discount(?:s|ed)?|costs?|costing|affordabl[ey]|cheap(?:er|est|ly)?)\b"
+                      r"|%\s*off\b|\bper\s*cent\s+off\b", re.I)
+# Claims about the brand's existing customers. "your customers" (the lead's own) never matches.
+SOCIAL_PROOF_RE = re.compile(
+    r"\bour\s+(?:existing\s+|current\s+|happy\s+)?(?:customers?|clients?|users|partners)\b"
+    r"|\b(?:trusted|used|loved|chosen|preferred|relied\s+on)\s+by\b"
+    r"|\b(?:salons?|barbers?|barber\s+shops?|shops?|stores?|businesses|brands|customers|clients|cafes|outlets)"
+    r"\s+(?:\w+\s+){0,3}?already\s+(?:use|using|love|trust|stock|rely)"
+    r"|\b\d[\d,]*\s*\+?\s*(?:other\s+)?(?:salons?|barbers?|barber\s+shops?|shops|stores|businesses|brands|customers|"
+    r"clients|cafes|outlets|users)\b"
+    r"|\b\d[\d,]*\s*\+\s*[a-z]"
+    r"|(?<!your\s)(?<!their\s)\b(?:customers|clients)\s+love\b"
+    r"|\btestimonials?\b|\b(?:happy|satisfied|loyal)\s+(?:customers|clients)\b", re.I)
 
 
 def _norm(text) -> str:
@@ -107,8 +125,10 @@ def validate(draft: dict, profile: dict, review: dict, said: str = "") -> list[s
             problems.append(f'sign the email with the {label} "{value}"')
     if any(ch in subject + body for ch in "{}❓"):
         problems.append("remove placeholders ({...} or ❓); use only known facts")
-    if (profile.get("pricing") or {}).get("mention_price") is not True and PRICE_RE.search(subject + " " + body):
+    if not llm.price_allowed(profile) and PRICE_RE.search(subject + " " + body):
         problems.append("do not mention prices")
+    if not llm.social_proof_allowed(profile) and SOCIAL_PROOF_RE.search(subject + " " + body):
+        problems.append("do not mention existing customers, clients or testimonials (who or how many already use it)")
     used = _hook_used(draft.get("hook_used"))
     if used and not hook_matches(used, review.get("hooks") or []):
         problems.append("hook_used must be one of the observed hooks (or null)")

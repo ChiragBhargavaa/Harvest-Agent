@@ -182,11 +182,31 @@ Rules: <= {max_words} words; subject <= 8 words, no clickbait or ALL CAPS; open 
 the qualification hooks (paraphrase, don't exaggerate); with no hooks, don't claim anything about the business and \
 use "hook_used": null. Describe the product ONLY with the user's wording above and the known facts: never add \
 qualities, origins, processes, certifications, awards, customer numbers or service promises (e.g. "single-origin", \
-"fresh-roasted", "small-batch", "custom wholesale supply") that are not written there. Social proof and price only \
-if the known facts allow it. One call to action: {cta}. Sign with the sender name, brand and phone only where they \
+"fresh-roasted", "small-batch", "cordless", "long battery life", "custom wholesale supply") that are not written \
+there. {price_rule}{proof_rule}One call to action: {cta}. Sign with the sender name, brand and phone only where they \
 are known facts. {unsubscribe_rule}Language: {language}. Follow these user style rules: {style_rules}. \
 Never invent facts, numbers, names or features. Reply ONLY with JSON: \
 {{"subject": "...", "body_text": "...", "hook_used": "... or null"}}"""
+
+
+NO_PRICE_RULE = ("Do not mention price, pricing, cost, discounts, '% off', offers on price, or words like affordable or "
+                 "cheap. ")
+NO_PROOF_RULE = ("Do not mention existing customers, clients or users of the brand, testimonials, or who or how many "
+                 "already use it (e.g. 'our customers', 'trusted by', '50+ salons'); the business's own customers "
+                 "('your customers') are fine. ")
+
+
+def price_allowed(profile: dict) -> bool:
+    return (profile.get("pricing") or {}).get("mention_price") is True
+
+
+def social_proof_allowed(profile: dict) -> bool:
+    """Only with can_name_customers: true AND customer names or a customer count filled in."""
+    proof = profile.get("social_proof") or {}
+    names = [n for n in proof.get("customer_names") or [] if not _unknown(n)]
+    count = proof.get("customers_count")
+    has_count = isinstance(count, int) and not isinstance(count, bool) and count > 0
+    return proof.get("can_name_customers") is True and bool(names or has_count)
 
 
 def _unknown(value) -> bool:
@@ -228,7 +248,10 @@ async def draft_email(profile: dict, lead: dict, qualification: dict, style_rule
     system = DRAFT_PROMPT.format(
         product=json.dumps(said or "unknown - describe the offer only with the known facts", ensure_ascii=False),
         facts=json.dumps(facts, ensure_ascii=False), unknown=", ".join(unknown) or "none",
-        max_words=e.get("max_words", 150), cta=cta.get("text") or "ask if a short call would be useful",
+        max_words=e.get("max_words", 150),
+        price_rule="" if price_allowed(profile) else NO_PRICE_RULE,
+        proof_rule="" if social_proof_allowed(profile) else NO_PROOF_RULE,
+        cta=cta.get("text") or "ask if a short call would be useful",
         unsubscribe_rule=f'End with this exact line: "{unsubscribe}". ' if unsubscribe else "",
         language=e.get("language", "English"), style_rules=style_rules,
     )

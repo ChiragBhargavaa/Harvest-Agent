@@ -9,12 +9,14 @@ brand:
   phone: "❓ optional"
   city: "❓ home city"
 offer:
-  product: "❓ what you sell, e.g. organic single-origin coffee beans"
+  product: "a new trimmer"
   one_liner: "❓ one sentence value proposition"
   value_props: ["❓", "❓"]
 ideal_customers:            # business types you want to reach and why they fit
-  - type: "❓ e.g. cafe"
-    why: "❓ e.g. they brew specialty coffee daily"
+  - type: "hair salon"
+    why: "❓ why they fit"
+  - type: "barber shop"
+    why: "❓ why they fit"
 social_proof:
   customers_count: null     # ❓ number of existing customers (null = don't mention)
   can_name_customers: false # ❓ only name customers with their permission
@@ -30,6 +32,6 @@ email:
   max_words: 140
   unsubscribe_line: "If you'd prefer not to hear from me again, just reply 'unsubscribe'."
 targeting:
-  default_city: "❓ e.g. Jaipur"
+  default_city: "Jodhpur"
   radius_km: 10
   batch_size: 15

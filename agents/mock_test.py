@@ -776,9 +776,76 @@ async def copywriter_live_fix_tests(args: dict):
     system = sent.get("system", "")
     unknown_line = next((x for x in system.splitlines() if x.startswith("UNKNOWN")), "")
     check("❓" not in system and "e.g. organic single-origin" not in system and "organic coffee beans" in system
-          and all(f in unknown_line for f in ("brand.name", "brand.sender_name", "offer.product", "offer.value_props"))
+          and all(f in unknown_line for f in ("brand.name", "brand.sender_name", "offer.one_liner", "offer.value_props",
+                                              "pricing.price_note"))
           and UNSUB in system and "Would a 15-minute call" in system,
           "llm.draft_email: ❓ profile fields are sent as explicitly unknown (never as text); brief + known facts kept")
+    check(llm.NO_PRICE_RULE in system and llm.NO_PROOF_RULE in system
+          and all(w in system for w in ("price", "cost", "discounts", "existing customers", "testimonials")),
+          "llm.draft_email: the prompt forbids price, cost, discounts, existing customers and testimonials")
+    trimmer_tests(real)
+
+
+def trimmer_tests(real: dict):
+    """Demo brand: sells 'a new trimmer' to salons/barbers in Jodhpur; nothing else is known (STEP 3b)."""
+    offer, brand, targeting = real.get("offer") or {}, real.get("brand") or {}, real.get("targeting") or {}
+    proof, pricing = real.get("social_proof") or {}, real.get("pricing") or {}
+    check(offer.get("product") == "a new trimmer" and targeting.get("default_city") == "Jodhpur"
+          and [c.get("type") for c in real.get("ideal_customers") or []] == ["hair salon", "barber shop"]
+          and all("❓" in str(c.get("why")) for c in real["ideal_customers"]),
+          "brand_profile.yaml: product 'a new trimmer', default_city Jodhpur, hair salon + barber shop (why still ❓)")
+    check(all("❓" in str(brand.get(k)) for k in ("name", "website", "sender_name", "phone", "city"))
+          and "❓" in str(offer.get("one_liner")) and all("❓" in str(x) for x in offer.get("value_props") or ["?"])
+          and proof.get("customers_count") is None and proof.get("can_name_customers") is False
+          and proof.get("customer_names") == [] and pricing.get("mention_price") is False
+          and not llm.price_allowed(real) and not llm.social_proof_allowed(real),
+          "brand_profile.yaml: brand facts, pricing and social proof are still unknown (❓ / null / false)")
+
+    profile = dict(PROFILE, offer={"product": "a new trimmer"})
+    review = {"hooks": [], "summary": ""}
+    said = "a new trimmer; I sell a new trimmer - find salons and barbers in Jodhpur"
+    base = f"Hi Razor team, would your stylists like to try a new trimmer?\n\nAsha, Bean Co\n{UNSUB}"
+
+    def problems(sentence: str, prof: dict = profile, why: str = said) -> list[str]:
+        body = base.replace("try a new trimmer?", f"try a new trimmer? {sentence}")
+        return copywriter.validate({"subject": "A new trimmer", "body_text": body, "hook_used": None}, prof, review, why)
+
+    check(problems("") == [], f"copywriter: plain trimmer draft passes ({problems('')})")
+    price = {s: problems(s) for s in ("It is priced at ₹999.", "Rs 1,200 only.", "Just INR 800.", "Only $15.",
+                                      "Ask about our pricing.", "We offer a launch discount.", "Get 20% off.",
+                                      "It costs less than you think.", "Very affordable.", "Cheap to run.",
+                                      "Special offer price this month.", "Low cost for salons.")}
+    check(all(p == ["do not mention prices"] for p in price.values()),
+          f"copywriter: price amounts and price words are problems when mention_price is false ({price})")
+    check(problems("Get 20% off.", dict(profile, pricing={"mention_price": True})) == [],
+          "copywriter: price words allowed when pricing.mention_price is true")
+    proof_msg = "do not mention existing customers, clients or testimonials (who or how many already use it)"
+    proof = {s: problems(s) for s in ("Our customers love it.", "Our clients say so.", "Trusted by 50 salons.",
+                                      "Used by top barbers.", "Many salons already use it.", "50+ salons use it.",
+                                      "Over 200 salons in Rajasthan.", "Customers love it.", "Read our testimonials.",
+                                      "We have many happy customers.")}
+    check(all(p == [proof_msg] for p in proof.values()),
+          f"copywriter: customer / social-proof claims are problems ({proof})")
+    ok = {s: problems(s) for s in ("Your customers will notice the clean lines.", "Your customers love a sharp fade.",
+                                   "Their customers expect quick trims.")}
+    check(all(p == [] for p in ok.values()), f"copywriter: the lead's own customers ('your customers') are fine ({ok})")
+    named = dict(profile, social_proof={"can_name_customers": True, "customer_names": ["Style Hub"], "customers_count": None})
+    check(problems("Our customers love it.", named) == []
+          and problems("Our customers love it.", dict(named, social_proof={"can_name_customers": True,
+                                                                         "customer_names": [], "customers_count": None}))
+          == [proof_msg]
+          and problems("Our customers love it.", dict(named, social_proof={"can_name_customers": False,
+                                                                         "customer_names": ["Style Hub"],
+                                                                         "customers_count": 12})) == [proof_msg],
+          "copywriter: social proof only with can_name_customers true AND names/count filled in")
+    claims = {s: problems(s) for s in ("It is cordless.", "Long battery life.", "Salon-grade precision.",
+                                       "Waterproof and lightweight.", "Comes with a warranty.")}
+    check(all(p and all("never say so" in x for x in p) for p in claims.values())
+          and any('"cordless"' in x for x in claims["It is cordless."]),
+          f"copywriter: trimmer quality claims not in the brief/profile are problems ({claims})")
+    check(problems("It is cordless.", why=said + "; it is cordless") == []
+          and problems("It is cordless.", dict(profile, offer={"product": "a new cordless trimmer"})) == [],
+          "copywriter: 'cordless' passes once the brief or a filled-in profile fact says so")
 
 
 def card_cap_tests():

@@ -386,15 +386,20 @@ It can be turned off with `ASI1_WEB_SEARCH=false`.
 
 **Deterministic draft validator (M4, `copywriter.validate`)** ✅: body word count ≤ `email.max_words` (default 150); subject
 non-empty, ≤ 8 words and ≤ 60 chars; the exact `email.unsubscribe_line` in the body; `brand.sender_name` and `brand.name`
-in the body; no `{` `}` or `❓` placeholders; no price (₹/Rs/INR/$ amounts, `/-`) unless `pricing.mention_price` is `true`;
-`hook_used` is null or matches a review hook's observation / evidence / angle. Profile values that are missing or still
+in the body; no `{` `}` or `❓` placeholders; no price (₹/Rs/INR/$ amounts, `/-`, or the words price/pricing/discount/cost/
+affordable/cheap, `% off`) unless `pricing.mention_price` is `true`; no social proof ("our customers/clients", "trusted by",
+"used by", "salons already use", "N+ salons", "customers love", testimonials, happy customers) unless
+`social_proof.can_name_customers` is `true` **and** `customer_names` or `customers_count` is filled in ("your customers",
+the lead's own, is fine); `hook_used` is null or matches a review hook's observation / evidence / angle. Profile values that are missing or still
 ❓ count as failures ("not filled in"), so an unfilled brand profile shows up as draft warnings, never as invented facts.
 **Product claims:** a fixed list of quality words (`copywriter.CLAIM_TERMS`: single-origin, fresh-roasted, small-batch,
-organic, artisan, certified, premium, wholesale, ...; hyphen/case-insensitive) may appear in the draft only if the
+organic, artisan, certified, premium, wholesale, cordless, waterproof, battery life, salon-grade, precision, lightweight,
+durable, warranty, guarantee, ...; hyphen/case-insensitive) may appear in the draft only if the
 brief, the ICP product, the filled-in profile facts or the lead's review hooks/summary contain it.
 **Prompt:** `llm.draft_email` sends only the filled-in profile facts (`llm.known_facts`: ❓/empty fields removed); the
 removed fields are listed as UNKNOWN by name, and the product may be described only with the user's wording (ICP product +
-brief) and those facts.
+brief) and those facts. Unless the profile allows them (same rules as the validator), it says explicitly: no price, cost or
+discounts, and no existing customers or testimonials.
 On failure regenerate once via `llm.draft_email(..., problems=[...])` (the problems are passed back to the LLM), then
 return the draft with the remaining problems as `warnings` (a failing regenerate keeps the first draft and its warnings).
 
@@ -500,7 +505,7 @@ Shared modules are fine for mailbox agents run from this repo. If an agent moves
 helpers into one file (§4.7).
 
 ### 3.18 Milestones and acceptance tests
-**Mock test** ✅ (`agents/mock_test.py`, 96 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
+**Mock test** ✅ (`agents/mock_test.py`, 107 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
 fetcher and `mx_ok` are monkeypatched; all agents + a scripted user run in a `Bureau(port=8010)`; exit code 0 = pass.
 
 | Milestone | Done when |
