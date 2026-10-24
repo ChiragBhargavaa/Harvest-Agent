@@ -436,6 +436,61 @@ def test_remote_success_skips_inline():
     assert ctx.remote_calls == 1
 
 
+def test_remote_sender_not_implemented_still_dry_runs():
+    """Approving the last draft must record a dry run even if the hosted sender refuses."""
+    ctx = FakeCtx()
+    os.environ["SENDER_AGENT_ADDRESS"] = "agent1qsender"
+    os.environ.pop("TEST_REDIRECT_TO", None)
+
+    async def remote(destination, message, response_type=None, timeout=30):
+        ctx.remote_calls += 1
+        return mod.ToolResponse(
+            ok=False,
+            error="send_emails is not implemented yet (milestone M6, stretch)",
+        ), "ok"
+
+    ctx.send_and_receive = remote
+    camp = mod.fresh_campaign()
+    camp["state"] = mod.AWAIT_DRAFTS
+    camp["leads"] = [{"id": "web:brew", "name": "Brew Lab"}]
+    camp["drafts"] = [{
+        "lead_id": "web:brew",
+        "to": "owner@brew.test",
+        "subject": "Hello from the roaster",
+        "body_text": "Hi",
+        "approved": False,
+    }]
+    camp["draft_cursor"] = 0
+    ctx.storage.set(mod.storage_key(SENDER), camp)
+    try:
+        async def run():
+            await mod.handle_chat(ctx, SENDER, chat("approve"))
+
+        asyncio.run(run())
+    finally:
+        os.environ.pop("SENDER_AGENT_ADDRESS", None)
+
+    joined = "\n".join(texts(ctx))
+    low = joined.lower()
+    assert "Dry run, nothing was sent" in joined
+    assert "Brew Lab" in joined
+    assert "owner@brew.test" in joined
+    assert "Hello from the roaster" in joined
+    assert "no email went out" in low
+    assert "real sending is off for the demo" in low
+    assert "failed" not in low
+    assert "not implemented" not in low
+    assert "milestone" not in low
+    assert "stretch" not in low
+    saved = ctx.storage.get(mod.storage_key(SENDER))
+    assert saved["state"] == mod.DONE
+    outbox = ctx.storage.get(mod.OUTBOX_KEY)
+    assert outbox[0]["lead_id"] == "web:brew"
+    assert outbox[0]["to"] == "owner@brew.test"
+    assert outbox[0]["subject"] == "Hello from the roaster"
+    assert outbox[0]["dry_run"] is True
+
+
 if __name__ == "__main__":
     test_file_compiles_and_protocols_match()
     test_logger_calls_take_one_message()
@@ -447,4 +502,5 @@ if __name__ == "__main__":
     test_inline_finder_and_remote_fallback()
     test_contacts_reviews_drafts_and_unpriced_pack()
     test_remote_success_skips_inline()
+    test_remote_sender_not_implemented_still_dry_runs()
     print("hosted tests ok")
