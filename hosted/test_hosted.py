@@ -782,6 +782,9 @@ def test_lead_pack_card_survives_bounced_request_and_simulates():
         payload = _card_payload(card_msg)
         assert payload["title"] == "Harvest Agent lead pack"
         values = " ".join(row["value"] for row in payload["summary_rows"])
+        labels = {row["label"]: row["value"] for row in payload["summary_rows"]}
+        assert labels["Recipient wallet"] == wallet
+        assert "Pay to agent" not in labels
         assert "0.25 FET" in values
         assert wallet in values
         assert request.reference in values
@@ -803,6 +806,69 @@ def test_lead_pack_card_survives_bounced_request_and_simulates():
     assert "owner@brew.test" in done
     assert ctx.storage.get(mod._pending_key(SENDER)) is None
     assert "verified lead pack" not in done
+
+
+def test_wallet_address_prefers_fetch_wallet_and_relabels_agent():
+    """ctx.wallet / agent.wallet.address() are cosmpy Address values, not str. LEADPACK_RECIPIENT
+    wins. With only an agent1… address, the card says Pay to agent."""
+    from cosmpy.aerial.wallet import LocalWallet
+
+    hosted = LocalWallet.generate()
+    fetch = str(hosted.address())
+    assert not isinstance(hosted.address(), str)
+    assert mod.RECIPIENT_RE.fullmatch(fetch)
+    os.environ["LEADPACK_PRICE"] = "0.25"
+    os.environ.pop("LEADPACK_RECIPIENT", None)
+    camp = mod.fresh_campaign()
+    camp["contacts"] = [{"lead_id": "web:brew", "email": "owner@brew.test"}]
+    camp["target"]["city"] = "Jaipur"
+
+    ctx = FakeCtx()
+    ctx.agent = type("A", (), {"address": "agent1qhostedorchestrator"})()
+    ctx.wallet = hosted.address()
+    assert mod.wallet_address(ctx) == fetch
+
+    ctx.wallet = None
+    ctx.agent = type("A", (), {"address": "agent1qhostedorchestrator", "wallet": hosted})()
+    assert mod.wallet_address(ctx) == fetch
+
+    ctx.wallet = None
+    ctx.agent = type("A", (), {"address": "agent1qonlyagentxxxxxxxxxxxxxxxxxxxxxxx"})()
+    saved = getattr(mod.agent, "wallet", None)
+    mod.agent.wallet = hosted
+    try:
+        assert mod.wallet_address(ctx) == fetch
+        override = "fetch1" + "r" * 39
+        os.environ["LEADPACK_RECIPIENT"] = f"  {override}  "
+        assert mod.wallet_address(ctx) == override
+        os.environ["LEADPACK_RECIPIENT"] = "not-a-wallet"
+        assert mod.wallet_address(ctx) == fetch
+        os.environ.pop("LEADPACK_RECIPIENT", None)
+        del mod.agent.wallet
+        assert mod.wallet_address(ctx) == "agent1qonlyagentxxxxxxxxxxxxxxxxxxxxxxx"
+        card = _card_payload(mod.lead_pack_card(mod.lead_pack_request(ctx, camp)))
+        labels = {row["label"]: row["value"] for row in card["summary_rows"]}
+        assert labels["Pay to agent"] == "agent1qonlyagentxxxxxxxxxxxxxxxxxxxxxxx"
+        assert "Recipient wallet" not in labels
+        assert "Recipient" not in labels
+    finally:
+        os.environ.pop("LEADPACK_PRICE", None)
+        os.environ.pop("LEADPACK_RECIPIENT", None)
+        if saved is None:
+            if hasattr(mod.agent, "wallet"):
+                del mod.agent.wallet
+        else:
+            mod.agent.wallet = saved
+
+    ctx.wallet = hosted.address()
+    os.environ["LEADPACK_PRICE"] = "0.25"
+    try:
+        card = _card_payload(mod.lead_pack_card(mod.lead_pack_request(ctx, camp)))
+        labels = {row["label"]: row["value"] for row in card["summary_rows"]}
+        assert labels["Recipient wallet"] == fetch
+        assert "Pay to agent" not in labels
+    finally:
+        os.environ.pop("LEADPACK_PRICE", None)
 
 
 def test_remote_error_falls_back_and_records_inline_actor():
@@ -1050,6 +1116,7 @@ if __name__ == "__main__":
     test_overpass_failover_and_partial_website_lookup()
     test_finder_overpass_mirrors()
     test_lead_pack_card_survives_bounced_request_and_simulates()
+    test_wallet_address_prefers_fetch_wallet_and_relabels_agent()
     test_remote_error_falls_back_and_records_inline_actor()
     test_handler_returns_before_the_finder_and_records_who()
     test_richer_contacts_are_context_and_email_only()
