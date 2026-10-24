@@ -11,6 +11,7 @@ Run:  python agents/lead_finder.py
 """
 
 import asyncio
+import os
 import re
 
 import geo
@@ -20,6 +21,9 @@ from crawl import PoliteFetcher, is_banned, name_matches, normalise_url
 
 MAX_LIMIT = 15
 VERIFY_CONCURRENCY = 5
+MAX_QUERIES = 3
+# one live ASI:One web-search call takes ~30-60 s; a slower one becomes a note, not a stalled step
+WEB_SEARCH_TIMEOUT_S = float(os.getenv("LEADREACH_WEB_SEARCH_TIMEOUT", "90"))
 STOP_WORDS = {"the", "and", "cafe", "café", "restaurant", "pvt", "ltd", "private", "limited"}
 
 
@@ -33,6 +37,17 @@ def _slug(name: str) -> str:
 
 def _rank(lead: dict) -> int:
     return (4 if lead.get("osm_emails") else 0) + (2 if lead.get("website") else 0) + (1 if lead.get("phone") else 0)
+
+
+def _why(err: BaseException) -> str:
+    return f"timed out after {WEB_SEARCH_TIMEOUT_S:g}s" if isinstance(err, asyncio.TimeoutError) else str(err)
+
+
+async def _discover_all(icp: dict, queries: list[str]) -> list:
+    """Run the web-search queries concurrently; each result is a list of businesses or the exception it raised."""
+    return await asyncio.gather(
+        *(asyncio.wait_for(llm.discover_businesses(icp, q), WEB_SEARCH_TIMEOUT_S) for q in queries),
+        return_exceptions=True)
 
 
 async def _verify_websites(leads: list[dict], notes: list[str]) -> None:
@@ -85,13 +100,12 @@ async def find_leads(args: dict) -> dict:
         lead["website_source"] = "osm" if lead["website"] else None
         by_name.setdefault(_norm_name(lead["name"]), lead)
 
-    # 2. ASI:One web search discovery (candidates)
+    # 2. ASI:One web search discovery (candidates); queries run concurrently, merged in query order
     web_found = 0
-    for query in (icp.get("search_queries") or [])[:3]:
-        try:
-            found = await llm.discover_businesses(icp, query)
-        except Exception as err:  # noqa: BLE001
-            notes.append(f"Web search failed for '{query}': {err}")
+    queries = (icp.get("search_queries") or [])[:MAX_QUERIES]
+    for query, found in zip(queries, await _discover_all(icp, queries), strict=True):
+        if isinstance(found, BaseException):
+            notes.append(f"Web search failed for '{query}': {_why(found)}")
             continue
         for b in found:
             key = _norm_name(b["name"])
@@ -120,13 +134,13 @@ async def find_leads(args: dict) -> dict:
     missing = [lead for lead in shortlist if not lead.get("website")][:10]
     if missing:
         try:
-            found = await llm.find_websites(missing, city)
+            found = await asyncio.wait_for(llm.find_websites(missing, city), WEB_SEARCH_TIMEOUT_S)
             for lead in missing:
                 url = normalise_url(found.get(lead["id"]))
                 if url and not is_banned(url):
                     lead["website"], lead["website_source"] = url, "web_candidate"
         except Exception as err:  # noqa: BLE001
-            notes.append(f"Website lookup failed: {err}")
+            notes.append(f"Website lookup failed: {_why(err)}")
 
     # 4. Verify every LLM-suggested website; web-only businesses need a verified site to stay
     await _verify_websites(shortlist, notes)

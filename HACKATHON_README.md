@@ -240,8 +240,9 @@ class ToolResponse(Model):
 `reply, status = await ctx.send_and_receive(addr, ToolRequest(...), response_type=ToolResponse, timeout=T)` — ✅ verified in
 `agents/mock_test.py`; `reply` is `None` on timeout.
 
-**Per-tool timeouts (s):** `find_leads` 150 · `find_contacts` 180 · `qualify_leads` 180 · `draft_emails` 120 · `send_emails` 60.
-Send **≤15 leads per request**.
+**Per-tool timeouts (s):** `find_leads` 300 · `find_contacts` 300 · `qualify_leads` 300 · `draft_emails` 240 · `send_emails` 60
+(sized for live web search + polite crawling; override with `LEADREACH_TIMEOUT_<TOOL>`, §3.16). The progress text is sent
+before the call. Send **≤15 leads per request**.
 
 ### 3.7 Tool args and result schemas
 **`find_leads`** ✅ implemented
@@ -251,6 +252,9 @@ Send **≤15 leads per request**.
 // result
 {"leads": [Lead], "call_list": [Lead], "source_notes": ["OpenStreetMap: 86 businesses ...; 8 list a website."], "city": "Jaipur, ..."}
 ```
+The ≤3 `search_queries` run `llm.discover_businesses` **concurrently** and are merged in query order. Every web-search call
+(`discover_businesses`, `find_websites`) is bounded by `LEADREACH_WEB_SEARCH_TIMEOUT` (default 90 s); a failed or timed-out
+query becomes a `source_notes` entry ("Web search failed for '<query>': ..."), never a step failure.
 **`find_contacts`** ✅ implemented (M2)
 ```jsonc
 {"leads": [Lead], "max_pages_per_site": 5}
@@ -428,6 +432,10 @@ latest year seen, keyword flags (online ordering, menu, events, catering), app-s
 
 ### 3.15 Reliability rules
 - Every external call has a timeout; transient errors go through `with_retry`.
+- Specialist timeouts must cover the live worst case: a live ASI:One web-search call takes ~30-60 s, so the lead finder runs
+  its queries concurrently and caps each at `LEADREACH_WEB_SEARCH_TIMEOUT`, and the orchestrator waits up to
+  `LEADREACH_TIMEOUT_<TOOL>` (§3.6). A reply that arrives after the orchestrator's timeout is dropped by uAgents
+  ("unrecognized schema digest"), so keep each specialist's own budget below its orchestrator timeout.
 - Partial success is fine (e.g. OSM down → web-search leads; web search down → OSM leads). Report what's missing and why
   (`source_notes`).
 - `send_and_receive` → `None` or `ok=False` → tell the user plainly and offer **retry** / **skip** (`STEP_FAILED`). Never silently move on.
@@ -446,6 +454,8 @@ latest year seen, keyword flags (online ordering, menu, events, catering), app-s
 | `LEAD_FINDER_AGENT_ADDRESS`, `CONTACT_FINDER_AGENT_ADDRESS`, `LEAD_ANALYST_AGENT_ADDRESS`, `COPYWRITER_AGENT_ADDRESS`, `SENDER_AGENT_ADDRESS` | Derived: `Identity.from_seed(seed, 0).address` ✅ |
 | `FOURSQUARE_API_KEY`, `GOOGLE_PLACES_API_KEY` | Optional extra lead sources (unused unless set) |
 | `MAILBOX`, `OWNER_MODE`, `*_PORT` | Runtime (tests force `MAILBOX=false`) |
+| `LEADREACH_TIMEOUT_FIND_LEADS`, `_FIND_CONTACTS`, `_QUALIFY_LEADS`, `_DRAFT_EMAILS`, `_SEND_EMAILS` | Optional: seconds the orchestrator waits for each specialist (defaults 300/300/300/240/60; invalid or ≤0 → default) |
+| `LEADREACH_WEB_SEARCH_TIMEOUT` | Optional: seconds per lead-finder web-search call (default 90) |
 | `RESEND_API_KEY`, `SENDER_FROM`, `REPLY_TO`, `DRY_RUN`, `TEST_REDIRECT_TO`, `DAILY_CAP` | Sending + safety defaults |
 
 ### 3.17 File layout
@@ -474,7 +484,7 @@ Shared modules are fine for mailbox agents run from this repo. If an agent moves
 helpers into one file (§4.7).
 
 ### 3.18 Milestones and acceptance tests
-**Mock test** ✅ (`agents/mock_test.py`, 76 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
+**Mock test** ✅ (`agents/mock_test.py`, 84 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
 fetcher and `mx_ok` are monkeypatched; all agents + a scripted user run in a `Bureau(port=8010)`; exit code 0 = pass.
 
 | Milestone | Done when |

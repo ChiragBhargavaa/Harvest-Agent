@@ -17,7 +17,7 @@ import llm
 from common import make_specialist
 
 DRAFT_CONCURRENCY = 8
-LLM_TIMEOUT_S = 25  # 2 waves x 2 attempts stays inside the orchestrator's 120 s draft_emails timeout
+LLM_TIMEOUT_S = 25  # 2 waves x 2 attempts stays inside the orchestrator's 240 s draft_emails timeout
 DEFAULT_MAX_WORDS = 150  # same default as llm.draft_email
 MAX_SUBJECT_WORDS, MAX_SUBJECT_CHARS = 8, 60
 MIN_HOOK_MATCH_CHARS = 10

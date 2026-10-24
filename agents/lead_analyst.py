@@ -50,7 +50,7 @@ def site_signals(page: Page) -> dict:
 CRAWL_CONCURRENCY = 5
 MAX_PAGES = 5
 MAX_HOOKS = 3
-LLM_TIMEOUT_S = 60  # keeps the whole step inside the orchestrator's 180 s qualify_leads timeout
+LLM_TIMEOUT_S = 60  # keeps the whole step inside the orchestrator's 300 s qualify_leads timeout
 PAGE_TEXT_CHARS = 4000  # what llm.qualify sends
 MIN_EVIDENCE_CHARS = 10
 STOPWORDS = {"the", "and", "with", "for", "that", "has", "have", "are", "its", "their", "from", "into", "offers",

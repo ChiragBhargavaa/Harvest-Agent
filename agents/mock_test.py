@@ -266,10 +266,97 @@ async def unit_tests():
           "web-search failure still returns OSM leads")
     check([x["name"] for x in out["call_list"]] == ["Chai Point Corner"], "phone-only business goes to call list")
 
+    await finder_unit_tests()
+    timeout_unit_tests()
     await contact_unit_tests()
     await analyst_unit_tests()
     await copywriter_unit_tests()
     await llm_request_tests()
+
+
+async def _find_with(fake, queries: list[str], timeout_s: float | None = None) -> tuple[dict, float]:
+    """find_leads with a fake llm.discover_businesses (and web-search timeout) -> (result, seconds taken)."""
+    llm.discover_businesses, original = fake, llm.discover_businesses
+    original_timeout = lead_finder.WEB_SEARCH_TIMEOUT_S
+    lead_finder.WEB_SEARCH_TIMEOUT_S = timeout_s or original_timeout
+    start = asyncio.get_running_loop().time()
+    try:
+        out = await lead_finder.find_leads({"icp": dict(ICP, search_queries=queries), "limit": 10})
+    finally:
+        llm.discover_businesses, lead_finder.WEB_SEARCH_TIMEOUT_S = original, original_timeout
+    return out, asyncio.get_running_loop().time() - start
+
+
+async def finder_unit_tests():
+    started: list[str] = []
+    brew = WEB_FOUND[0]
+
+    async def slow_search(icp, query):
+        started.append(query)
+        if query == "q1":  # slowest, but its result must win the merge (query order, not finish order)
+            await asyncio.sleep(0.3)
+            return [brew]
+        if query == "q2":  # same business, dead URL
+            await asyncio.sleep(0.1)
+            return [dict(brew, website="https://ghost.example.in")]
+        if query == "q3":
+            await asyncio.sleep(0.2)
+            raise RuntimeError("ASI:One unavailable")
+        return [dict(brew, name="Fourth Query Cafe")]
+
+    out, took = await _find_with(slow_search, ["q1", "q2", "q3", "q4"])
+    names = [x["name"] for x in out["leads"]]
+    check(took < 0.5 and sorted(started) == ["q1", "q2", "q3"],
+          f"finder: ≤3 web-search queries run concurrently ({took:.2f}s < 0.6s sequential; ran {sorted(started)})")
+    check("Brew Lab Roasters" in names and "Fourth Query Cafe" not in names
+          and next(x for x in out["leads"] if x["name"] == "Brew Lab Roasters")["website"] == "https://brewlab.test",
+          "finder: concurrent results merged in query order")
+    check(any(n == "Web search failed for 'q3': ASI:One unavailable" for n in out["source_notes"])
+          and len(out["leads"]) == 3, "finder: one failed query -> a note, the other queries' leads kept")
+
+    async def hanging(icp, query):
+        if query == "slow":
+            await asyncio.sleep(5)
+        return [brew]
+
+    out, took = await _find_with(hanging, ["slow", "fast"], timeout_s=0.2)
+    check(took < 1 and any(n == "Web search failed for 'slow': timed out after 0.2s" for n in out["source_notes"])
+          and "Brew Lab Roasters" in [x["name"] for x in out["leads"]],
+          f"finder: a timed-out query becomes a note, not a failure ({took:.2f}s)")
+
+    async def hanging_websites(businesses, city):
+        await asyncio.sleep(5)
+        return {}
+
+    llm.find_websites, original = hanging_websites, llm.find_websites
+    try:
+        out, took = await _find_with(hanging, ["fast"], timeout_s=0.2)
+    finally:
+        llm.find_websites = original
+    check(took < 1 and "Website lookup failed: timed out after 0.2s" in out["source_notes"] and out["leads"],
+          "finder: website lookup is bounded by the web-search timeout too")
+
+
+def timeout_unit_tests():
+    key = "LEADREACH_TIMEOUT_FIND_LEADS"
+    saved = os.environ.pop(key, None)
+    try:
+        seen = {}
+        for value in (None, "450", "abc", "0"):
+            if value is not None:
+                os.environ[key] = value
+            seen[value] = orchestrator.tool_timeout("find_leads")
+    finally:
+        os.environ.pop(key, None)
+        if saved is not None:
+            os.environ[key] = saved
+    check(seen == {None: 300, "450": 450, "abc": 300, "0": 300},
+          f"orchestrator: find_leads timeout 300 s by default, LEADREACH_TIMEOUT_FIND_LEADS overrides it ({seen})")
+    check({t: d for t, (_, d) in orchestrator.SPECIALISTS.items()} ==
+          {"find_leads": 300, "find_contacts": 300, "qualify_leads": 300, "draft_emails": 240, "send_emails": 60},
+          "orchestrator: default specialist timeouts sized for live web search + crawling")
+    check(lead_finder.WEB_SEARCH_TIMEOUT_S * 2 + 60 < orchestrator.SPECIALISTS["find_leads"][1],
+          "finder: discovery + website lookup + verification fit inside the find_leads timeout")
 
 
 class FakeCompletions:

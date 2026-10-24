@@ -24,12 +24,13 @@ import llm
 import state as st
 from common import ROOT, ToolRequest, ToolResponse, ack, chat_text, env_bool, require_env, text_of
 
-# tool -> (env var with the specialist address, timeout seconds)
+# tool -> (env var with the specialist address, default timeout seconds; override with LEADREACH_TIMEOUT_<TOOL>)
+# Sized for live ASI:One web search (~30-60 s per call) plus polite crawling (1 request/s per site).
 SPECIALISTS = {
-    "find_leads": ("LEAD_FINDER_AGENT_ADDRESS", 150),
-    "find_contacts": ("CONTACT_FINDER_AGENT_ADDRESS", 180),
-    "qualify_leads": ("LEAD_ANALYST_AGENT_ADDRESS", 180),
-    "draft_emails": ("COPYWRITER_AGENT_ADDRESS", 120),
+    "find_leads": ("LEAD_FINDER_AGENT_ADDRESS", 300),
+    "find_contacts": ("CONTACT_FINDER_AGENT_ADDRESS", 300),
+    "qualify_leads": ("LEAD_ANALYST_AGENT_ADDRESS", 300),
+    "draft_emails": ("COPYWRITER_AGENT_ADDRESS", 240),
     "send_emails": ("SENDER_AGENT_ADDRESS", 60),
 }
 GATE_TOOL = {"leads": "find_leads", "contacts": "find_contacts", "reviews": "qualify_leads",
@@ -116,9 +117,19 @@ async def understand(text: str, camp: dict) -> dict:
 
 # ---------------- specialists ----------------
 
+def tool_timeout(tool: str) -> float:
+    """Seconds to wait for a specialist: LEADREACH_TIMEOUT_<TOOL> if it is a positive number, else the default."""
+    default = SPECIALISTS[tool][1]
+    try:
+        value = float(os.getenv(f"LEADREACH_TIMEOUT_{tool.upper()}", "") or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 async def call_tool(ctx: Context, tool: str, args: dict) -> tuple[dict | None, str]:
     """-> (result, error). Never raises."""
-    env_name, timeout = SPECIALISTS[tool]
+    env_name, timeout = SPECIALISTS[tool][0], tool_timeout(tool)
     address = os.getenv(env_name, "")
     if not address:
         return None, f"the {tool} agent address is not configured ({env_name})"
@@ -128,7 +139,7 @@ async def call_tool(ctx: Context, tool: str, args: dict) -> tuple[dict | None, s
     except Exception as err:  # noqa: BLE001
         return None, f"could not reach the {tool} agent ({err})"
     if not isinstance(reply, ToolResponse):
-        return None, f"the {tool} agent did not answer within {timeout}s ({status})"
+        return None, f"the {tool} agent did not answer within {timeout:g}s ({status})"
     if not reply.ok:
         return None, reply.error or "unknown error"
     try:
