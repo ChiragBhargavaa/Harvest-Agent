@@ -95,10 +95,15 @@ async def find_leads(args: dict) -> dict:
     except Exception as err:  # noqa: BLE001 - partial success: continue with web search
         osm = []
         notes.append(f"OpenStreetMap failed ({err}); using web search only.")
+    banned_osm = 0
     for lead in osm:
-        lead["website"] = normalise_url(lead.get("website"))
-        lead["website_source"] = "osm" if lead["website"] else None
+        url = normalise_url(lead.get("website"))
+        if url and is_banned(url):  # e.g. a zomato.com page in the OSM website tag: treat as no website
+            url, banned_osm = None, banned_osm + 1
+        lead["website"], lead["website_source"] = url, "osm" if url else None
         by_name.setdefault(_norm_name(lead["name"]), lead)
+    if banned_osm:
+        notes.append(f"Ignored {banned_osm} OpenStreetMap website tag(s) pointing at directories or social media.")
 
     # 2. ASI:One web search discovery (candidates); queries run concurrently, merged in query order
     web_found = 0

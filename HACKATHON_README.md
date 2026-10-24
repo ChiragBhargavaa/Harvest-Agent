@@ -255,6 +255,8 @@ before the call. Send **≤15 leads per request**.
 The ≤3 `search_queries` run `llm.discover_businesses` **concurrently** and are merged in query order. Every web-search call
 (`discover_businesses`, `find_websites`) is bounded by `LEADREACH_WEB_SEARCH_TIMEOUT` (default 90 s); a failed or timed-out
 query becomes a `source_notes` entry ("Web search failed for '<query>': ..."), never a step failure.
+An OSM `website`/`contact:website` tag on a banned host (§3.13, e.g. a zomato.com page) is treated as no website: it is
+never shown or crawled, and a `source_notes` entry counts them.
 **`find_contacts`** ✅ implemented (M2)
 ```jsonc
 {"leads": [Lead], "max_pages_per_site": 5}
@@ -276,14 +278,20 @@ LLM failure (error, timeout, bad JSON, missing/invalid `fit_score` or `hooks`) �
 (`no_website|banned_host|robots_disallowed|unreachable`), signals-only, no LLM call. `contacts` is accepted but not used yet.
 **`draft_emails`** ✅ implemented (M4)
 ```jsonc
-{"profile": BrandProfile, "style_rules": [], "icp": ICP, "leads": [Lead], "contacts": [Contact], "reviews": [Review]}
+{"profile": BrandProfile, "brief": "<the user's own words>", "style_rules": [], "icp": ICP, "leads": [Lead],
+ "contacts": [Contact], "reviews": [Review]}
 → {"drafts": [Draft], "skipped": [{"lead_id": "...", "reason": "no_contact|llm_failed", "detail": "... (llm_failed only)"}]}
 ```
 One draft per lead that has a contact, addressed to its first (= primary, §3.7 `find_contacts` sort) contact; sorted best
-fit first. Leads are drafted concurrently (≤8 at a time), `llm.draft_email` with a 25 s timeout per attempt, then the
-validator (§3.12). A lead with no contact, or whose first LLM call fails (error, timeout, bad JSON), goes to `skipped`:
-the copywriter never writes a draft without the LLM. The orchestrator stores `skipped` as `draft_skipped` and names those
-leads on the first draft card.
+fit first. Contact confidence doesn't matter here: low-confidence contacts get drafts too (their explicit approval is a
+send-time invariant, §3.4). Leads are drafted concurrently (≤15 at a time = one wave), `llm.draft_email(..., product=
+icp.product, brief=brief)` with a `LEADREACH_DRAFT_LLM_TIMEOUT` (default 100 s) timeout per attempt (2 attempts fit the
+240 s `draft_emails` timeout), then the validator (§3.12). A lead with no contact, or whose first LLM call fails (error,
+timeout, bad JSON), goes to `skipped`: the copywriter never writes a draft without the LLM. `detail` says why (e.g.
+"timed out after 100s"; secrets redacted) and both the copywriter and the orchestrator log it as a warning. (Live
+24 Oct 2026: a 25 s timeout cancelled 2 of 3 calls in flight; httpx logs a request only once it is answered, so no
+request appeared in the log.) The orchestrator stores `skipped` as `draft_skipped` and names those leads on the first
+draft card.
 **`send_emails`** (stretch)
 ```jsonc
 {"campaign_id": "c_...", "drafts": [Draft], "dry_run": true, "redirect_to": "test@example.com", "daily_cap": 5}
@@ -362,7 +370,8 @@ ANY --status--> status detail card;  --log--> last 10 audit entries
 
 ### 3.11 Cards (`agents/cards.py`, payload schemas ✅ §4.5)
 - **The narration must stand alone:** it lists the items and says how to reply in chat ("Reply approve, remove 2, 5, or redo…").
-- One review card per checkpoint (≤15 rows). One card per ChatMessage. ⚠️ Whether consecutive messages (progress text + card)
+- One review card per checkpoint (≤15 rows; with more, the title says "(showing 15 of N)" and rows keep their
+  numbers, so **remove N** still means row N). One card per ChatMessage. ⚠️ Whether consecutive messages (progress text + card)
   both render in ASI:One is unverified — check early.
 - `EndSessionContent` only when the campaign is `DONE`.
 - Builders: `setup_form`, `settings_form`, `review_card`, `draft_card`, `detail_card`, `status_card` (terminal).
@@ -380,6 +389,12 @@ non-empty, ≤ 8 words and ≤ 60 chars; the exact `email.unsubscribe_line` in t
 in the body; no `{` `}` or `❓` placeholders; no price (₹/Rs/INR/$ amounts, `/-`) unless `pricing.mention_price` is `true`;
 `hook_used` is null or matches a review hook's observation / evidence / angle. Profile values that are missing or still
 ❓ count as failures ("not filled in"), so an unfilled brand profile shows up as draft warnings, never as invented facts.
+**Product claims:** a fixed list of quality words (`copywriter.CLAIM_TERMS`: single-origin, fresh-roasted, small-batch,
+organic, artisan, certified, premium, wholesale, ...; hyphen/case-insensitive) may appear in the draft only if the
+brief, the ICP product, the filled-in profile facts or the lead's review hooks/summary contain it.
+**Prompt:** `llm.draft_email` sends only the filled-in profile facts (`llm.known_facts`: ❓/empty fields removed); the
+removed fields are listed as UNKNOWN by name, and the product may be described only with the user's wording (ICP product +
+brief) and those facts.
 On failure regenerate once via `llm.draft_email(..., problems=[...])` (the problems are passed back to the LLM), then
 return the draft with the remaining problems as `warnings` (a failing regenerate keeps the first draft and its warnings).
 
@@ -456,6 +471,7 @@ latest year seen, keyword flags (online ordering, menu, events, catering), app-s
 | `MAILBOX`, `OWNER_MODE`, `*_PORT` | Runtime (tests force `MAILBOX=false`) |
 | `LEADREACH_TIMEOUT_FIND_LEADS`, `_FIND_CONTACTS`, `_QUALIFY_LEADS`, `_DRAFT_EMAILS`, `_SEND_EMAILS` | Optional: seconds the orchestrator waits for each specialist (defaults 300/300/300/240/60; invalid or ≤0 → default) |
 | `LEADREACH_WEB_SEARCH_TIMEOUT` | Optional: seconds per lead-finder web-search call (default 90) |
+| `LEADREACH_DRAFT_LLM_TIMEOUT` | Optional: seconds per copywriter `llm.draft_email` attempt (default 100; invalid or ≤0 → default) |
 | `RESEND_API_KEY`, `SENDER_FROM`, `REPLY_TO`, `DRY_RUN`, `TEST_REDIRECT_TO`, `DAILY_CAP` | Sending + safety defaults |
 
 ### 3.17 File layout
@@ -484,7 +500,7 @@ Shared modules are fine for mailbox agents run from this repo. If an agent moves
 helpers into one file (§4.7).
 
 ### 3.18 Milestones and acceptance tests
-**Mock test** ✅ (`agents/mock_test.py`, 84 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
+**Mock test** ✅ (`agents/mock_test.py`, 96 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
 fetcher and `mx_ok` are monkeypatched; all agents + a scripted user run in a `Bureau(port=8010)`; exit code 0 = pass.
 
 | Milestone | Done when |

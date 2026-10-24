@@ -22,7 +22,7 @@ from uagents_core.contrib.protocols.chat import ChatAcknowledgement, ChatMessage
 import cards
 import llm
 import state as st
-from common import ROOT, ToolRequest, ToolResponse, ack, chat_text, env_bool, require_env, text_of
+from common import ROOT, ToolRequest, ToolResponse, ack, chat_text, env_bool, env_seconds, redact, require_env, text_of
 
 # tool -> (env var with the specialist address, default timeout seconds; override with LEADREACH_TIMEOUT_<TOOL>)
 # Sized for live ASI:One web search (~30-60 s per call) plus polite crawling (1 request/s per site).
@@ -119,12 +119,7 @@ async def understand(text: str, camp: dict) -> dict:
 
 def tool_timeout(tool: str) -> float:
     """Seconds to wait for a specialist: LEADREACH_TIMEOUT_<TOOL> if it is a positive number, else the default."""
-    default = SPECIALISTS[tool][1]
-    try:
-        value = float(os.getenv(f"LEADREACH_TIMEOUT_{tool.upper()}", "") or default)
-    except ValueError:
-        return default
-    return value if value > 0 else default
+    return env_seconds(f"LEADREACH_TIMEOUT_{tool.upper()}", SPECIALISTS[tool][1])
 
 
 async def call_tool(ctx: Context, tool: str, args: dict) -> tuple[dict | None, str]:
@@ -234,7 +229,7 @@ def step_args(gate: str, camp: dict) -> dict:
     if gate == "reviews":
         return {"icp": camp["icp"], "leads": camp["leads"], "contacts": camp["contacts"]}
     if gate == "drafts":
-        return {"profile": load_profile(), "style_rules": camp["style_rules"], "icp": camp["icp"],
+        return {"profile": load_profile(), "brief": camp["brief"], "style_rules": camp["style_rules"], "icp": camp["icp"],
                 "leads": camp["leads"], "contacts": camp["contacts"], "reviews": camp["reviews"]}
     return {"campaign_id": camp["campaign_id"], "drafts": [d for d in camp["drafts"] if d.get("approved")],
             "dry_run": camp["settings"]["dry_run"], "redirect_to": os.getenv("TEST_REDIRECT_TO", ""),
@@ -279,6 +274,8 @@ async def run_from(ctx: Context, sender: str, camp: dict, gate: str) -> None:
                 await ctx.send(sender, chat_text(
                     f"⚠ The **{gate}** step failed: {error}\n\nReply **retry** to try again, or **skip** to move on."))
                 return
+            if gate == "drafts":
+                log_draft_skips(ctx, result)
             count = store_result(gate, camp, result)
             st.log(camp, gate, f"produced {count}", "system")
             if gate in ("leads", "drafts") and count == 0:
@@ -297,6 +294,13 @@ async def run_from(ctx: Context, sender: str, camp: dict, gate: str) -> None:
     camp["state"] = st.DONE
     await ctx.send(sender, chat_text("Campaign complete. Say **status** for a summary or **new campaign**.",
                                      end_session=True))
+
+
+def log_draft_skips(ctx: Context, result: dict) -> None:
+    """Why each lead got no draft (the card only says "the writer failed"), so live failures are diagnosable."""
+    for s in result.get("skipped") or []:
+        detail = f": {redact(s['detail'])}" if s.get("detail") else ""
+        ctx.logger.warning(f"no draft for {s.get('lead_id')} ({s.get('reason')}){detail}")
 
 
 def next_gate(gate: str) -> str | None:
@@ -413,6 +417,7 @@ async def redraft(ctx: Context, sender: str, camp: dict, lead_ids: list[str], ex
     result, error = await call_tool(ctx, "draft_emails", args)
     if result is None:
         return error
+    log_draft_skips(ctx, result)
     new = {d["lead_id"]: d for d in result.get("drafts", []) if d.get("lead_id") in ids}
     camp["drafts"] = [new.get(d["lead_id"], d) for d in camp["drafts"]]  # an LLM failure keeps the old draft
     return "" if new else "the writer returned no draft"

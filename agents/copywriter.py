@@ -4,23 +4,38 @@ Pipeline per lead (<=8 leads at a time): pick the lead's primary contact (contac
 llm.draft_email(profile, lead, review, style_rules) -> validate(). Validator (HACKATHON_README §3.12): word count
 <= max_words; subject <= 8 words and <= 60 chars; the exact unsubscribe line; sender name + brand present; no
 {placeholders} or ❓; no price unless pricing.mention_price; hook_used matches one of the lead's review hooks.
-On failure regenerate once with the problems passed back; if it still fails, keep the draft with `warnings`.
-Leads without a contact, or whose LLM call fails, go to `skipped` (no draft is ever written without the LLM).
+Also: no product claim (e.g. "single-origin", "fresh-roasted") that the brief, the ICP product, the filled-in
+profile facts and the lead's review don't contain. On failure regenerate once with the problems passed back; if it
+still fails, keep the draft with `warnings`. Leads without a contact, or whose LLM call fails, go to `skipped` (no
+draft is ever written without the LLM). Low-confidence contacts are drafted too: their approval is enforced at send
+time (§3.4).
 
 Run:  python agents/copywriter.py
 """
 
 import asyncio
+import json
+import logging
 import re
 
 import llm
-from common import make_specialist
+from common import env_seconds, make_specialist, redact
 
-DRAFT_CONCURRENCY = 8
-LLM_TIMEOUT_S = 25  # 2 waves x 2 attempts stays inside the orchestrator's 240 s draft_emails timeout
+NAME = "leadreach-writer"
+log = logging.getLogger(NAME)  # the agent's own logger (uAgents names it after the agent)
+DRAFT_CONCURRENCY = 15  # = the ≤15 leads per request (§3.6): one wave
+# A live ASI:One draft call can take 30+ s, and an in-flight call cancelled by this timeout is never logged by
+# httpx. One wave x 2 attempts x 100 s stays inside the orchestrator's 240 s draft_emails timeout.
+LLM_TIMEOUT_S = env_seconds("LEADREACH_DRAFT_LLM_TIMEOUT", 100)
 DEFAULT_MAX_WORDS = 150  # same default as llm.draft_email
 MAX_SUBJECT_WORDS, MAX_SUBJECT_CHARS = 8, 60
 MIN_HOOK_MATCH_CHARS = 10
+# Product qualities the LLM likes to add; each must appear in the brief / ICP product / known profile facts / review.
+CLAIM_TERMS = (
+    "single origin", "fresh roasted", "freshly roasted", "small batch", "organic", "artisan", "artisanal",
+    "handcrafted", "hand crafted", "handmade", "award winning", "certified", "fair trade", "ethically sourced",
+    "sustainably sourced", "direct trade", "premium", "specialty grade", "locally roasted", "farm to cup", "wholesale",
+)
 PRICE_RE = re.compile(r"₹\s*\d|\b(?:rs|inr|usd)\.?\s*\d|\$\s*\d|\d[\d,.]*\s*(?:/-|rupees\b|rs\b|inr\b)", re.I)
 
 
@@ -52,8 +67,21 @@ def hook_matches(hook_used: str, hooks: list[dict]) -> bool:
     return False
 
 
-def validate(draft: dict, profile: dict, review: dict) -> list[str]:
-    """Deterministic checks from §3.12. -> problems (empty = pass). Problems are phrased for the LLM to fix."""
+def _words(text) -> str:
+    return " " + " ".join(re.findall(r"[a-z0-9%]+", str(text or "").lower())) + " "
+
+
+def unsupported_claims(text: str, said: str, profile: dict, review: dict) -> list[str]:
+    """CLAIM_TERMS in `text` that no allowed source contains (❓/empty profile fields don't count)."""
+    allowed = _words(" ".join([said, json.dumps(llm.known_facts(profile)[0], ensure_ascii=False),
+                               json.dumps(review.get("hooks") or [], ensure_ascii=False), str(review.get("summary") or "")]))
+    used = _words(text)
+    return [t for t in CLAIM_TERMS if f" {t} " in used and f" {t} " not in allowed]
+
+
+def validate(draft: dict, profile: dict, review: dict, said: str = "") -> list[str]:
+    """Deterministic checks from §3.12. -> problems (empty = pass). Problems are phrased for the LLM to fix.
+    `said` = the user's own product wording (ICP product + brief)."""
     brand, email = profile.get("brand") or {}, profile.get("email") or {}
     subject, body = str(draft.get("subject") or "").strip(), str(draft.get("body_text") or "").strip()
     problems = []
@@ -84,6 +112,8 @@ def validate(draft: dict, profile: dict, review: dict) -> list[str]:
     used = _hook_used(draft.get("hook_used"))
     if used and not hook_matches(used, review.get("hooks") or []):
         problems.append("hook_used must be one of the observed hooks (or null)")
+    for term in unsupported_claims(subject + " " + body, said, profile, review):
+        problems.append(f'do not call the product "{term}": the brief and brand profile never say so')
     return problems
 
 
@@ -94,32 +124,40 @@ def _as_draft(lead_id: str, to: str, raw: dict, warnings: list[str]) -> dict:
             "approved": False}
 
 
-async def _llm_draft(profile: dict, lead: dict, review: dict, style_rules: list[str],
+def _why(err: BaseException) -> str:
+    if isinstance(err, asyncio.TimeoutError):  # str() is empty
+        return f"timed out after {LLM_TIMEOUT_S:g}s"
+    return redact(f"{type(err).__name__}: {err}")[:200]
+
+
+async def _llm_draft(profile: dict, lead: dict, review: dict, style_rules: list[str], product: str, brief: str,
                      problems: list[str] | None = None) -> dict:
-    raw = await asyncio.wait_for(llm.draft_email(profile, lead, review, style_rules, problems=problems),
-                                 LLM_TIMEOUT_S)
+    raw = await asyncio.wait_for(llm.draft_email(profile, lead, review, style_rules, problems=problems,
+                                                 product=product, brief=brief), LLM_TIMEOUT_S)
     if not isinstance(raw, dict):
         raise ValueError("LLM draft is not a JSON object")
     return raw
 
 
 async def draft_one(profile: dict, lead: dict, contact: dict | None, review: dict, style_rules: list[str],
-                    sem: asyncio.Semaphore) -> tuple[dict | None, dict | None]:
-    """-> (draft, None) or (None, skipped entry). Never raises."""
+                    sem: asyncio.Semaphore, product: str = "", brief: str = "") -> tuple[dict | None, dict | None]:
+    """-> (draft, None) or (None, skipped entry). Never raises. Contact confidence doesn't matter here (§3.4)."""
     if not contact or not contact.get("email"):
         return None, {"lead_id": lead["id"], "reason": "no_contact"}
+    said = "; ".join(x for x in (product, brief) if x)
     async with sem:
         try:
-            raw = await _llm_draft(profile, lead, review, style_rules)
+            raw = await _llm_draft(profile, lead, review, style_rules, product, brief)
         except Exception as err:  # noqa: BLE001 - error, timeout, bad JSON -> report this lead, keep going
-            return None, {"lead_id": lead["id"], "reason": "llm_failed", "detail": f"{type(err).__name__}: {err}"[:200]}
-        problems = validate(raw, profile, review)
+            log.warning(f"no draft for {lead['id']}: {_why(err)}")
+            return None, {"lead_id": lead["id"], "reason": "llm_failed", "detail": _why(err)}
+        problems = validate(raw, profile, review, said)
         if problems:  # regenerate once with the problems passed back
             try:
-                retry = await _llm_draft(profile, lead, review, style_rules, problems=problems)
-                raw, problems = retry, validate(retry, profile, review)
-            except Exception:  # noqa: BLE001 - keep the first draft and its warnings
-                pass
+                retry = await _llm_draft(profile, lead, review, style_rules, product, brief, problems=problems)
+                raw, problems = retry, validate(retry, profile, review, said)
+            except Exception as err:  # noqa: BLE001 - keep the first draft and its warnings
+                log.warning(f"regenerating the draft for {lead['id']} failed, keeping the first one: {_why(err)}")
     return _as_draft(lead["id"], contact["email"], raw, problems), None
 
 
@@ -131,6 +169,8 @@ async def draft_emails(args: dict) -> dict:
         raise ValueError("every lead needs an 'id'")
     profile = args.get("profile") if isinstance(args.get("profile"), dict) else {}
     style_rules = [str(r) for r in args.get("style_rules") or []]
+    product = str((args.get("icp") or {}).get("product") or "").strip()
+    brief = str(args.get("brief") or "").strip()
     contacts, reviews = {}, {}
     for c in args.get("contacts") or []:  # sorted per lead by find_contacts: the first one is the primary contact
         contacts.setdefault(c.get("lead_id"), c)
@@ -138,14 +178,14 @@ async def draft_emails(args: dict) -> dict:
         reviews.setdefault(r.get("lead_id"), r)
     sem = asyncio.Semaphore(DRAFT_CONCURRENCY)
     results = await asyncio.gather(*(draft_one(profile, lead, contacts.get(lead["id"]), reviews.get(lead["id"], {}),
-                                               style_rules, sem) for lead in leads))
+                                               style_rules, sem, product, brief) for lead in leads))
     drafts = [d for d, _ in results if d]
     drafts.sort(key=lambda d: -(reviews.get(d["lead_id"], {}).get("fit_score") or 0))  # best fit first (stable)
     return {"drafts": drafts, "skipped": [s for _, s in results if s]}
 
 
 agent = make_specialist(
-    name="leadreach-writer",
+    name=NAME,
     seed_env="WRITER_SEED",
     port_env="WRITER_PORT",
     default_port=8005,

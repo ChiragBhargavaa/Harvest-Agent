@@ -6,6 +6,7 @@ ASI:One LLM, OpenStreetMap and website fetching mocked. No keys or network neede
 
 import asyncio
 import json
+import logging
 import os
 import threading
 
@@ -21,6 +22,7 @@ os.environ.update({f"{p}_PORT": str(8101 + i) for i, p in enumerate(("ORCH", "FI
 from uagents import Agent, Bureau, Context  # noqa: E402
 from uagents_core.contrib.protocols.chat import ChatAcknowledgement, ChatMessage, MetadataContent  # noqa: E402
 
+import cards  # noqa: E402
 import contact_finder  # noqa: E402
 import copywriter  # noqa: E402
 import geo  # noqa: E402
@@ -31,7 +33,7 @@ import orchestrator  # noqa: E402
 import sender  # noqa: E402
 import state as st  # noqa: E402
 from common import chat_text, text_of  # noqa: E402
-from crawl import Page, domain_of  # noqa: E402
+from crawl import Page, domain_of, is_banned  # noqa: E402
 
 os.environ.update({
     "LEAD_FINDER_AGENT_ADDRESS": lead_finder.agent.address,
@@ -183,9 +185,10 @@ PROFILE = {"brand": {"name": "Bean Co", "sender_name": "Asha"}, "offer": {"produ
 draft_calls: list[dict] = []
 
 
-async def fake_draft_email(profile, lead, qualification, style_rules, problems=None):
+async def fake_draft_email(profile, lead, qualification, style_rules, problems=None, product="", brief=""):
     """A valid draft for PROFILE; the body echoes the style rules so tests can see they arrived."""
-    draft_calls.append({"lead": lead["id"], "style_rules": list(style_rules), "problems": problems})
+    draft_calls.append({"lead": lead["id"], "style_rules": list(style_rules), "problems": problems,
+                        "product": product, "brief": brief})
     hooks = qualification.get("hooks") or []
     style = f" ({'; '.join(style_rules)})" if style_rules else ""
     body = (f"Hi {lead['name']} team, I noticed you take orders by email{style}. We roast organic beans locally. "
@@ -195,6 +198,7 @@ async def fake_draft_email(profile, lead, qualification, style_rules, problems=N
 
 
 original_load_profile = orchestrator.load_profile
+real_draft_email = llm.draft_email
 orchestrator.load_profile = lambda: PROFILE
 llm.draft_email = fake_draft_email
 llm.parse_intent = fake_parse_intent
@@ -267,10 +271,13 @@ async def unit_tests():
     check([x["name"] for x in out["call_list"]] == ["Chai Point Corner"], "phone-only business goes to call list")
 
     await finder_unit_tests()
+    await banned_osm_website_test()
     timeout_unit_tests()
     await contact_unit_tests()
     await analyst_unit_tests()
     await copywriter_unit_tests()
+    card_cap_tests()
+    orchestrator_log_tests()
     await llm_request_tests()
 
 
@@ -335,6 +342,35 @@ async def finder_unit_tests():
         llm.find_websites = original
     check(took < 1 and "Website lookup failed: timed out after 0.2s" in out["source_notes"] and out["leads"],
           "finder: website lookup is bounded by the web-search timeout too")
+
+
+async def banned_osm_website_test():
+    tvg = dict(OSM_LEADS[0], id="osm:node/7", name="TVG Amer Restaurant", website="https://www.zomato.com/jaipur/tvg",
+               phone="+91 98290 22222")
+    mail = dict(OSM_LEADS[0], id="osm:node/8", name="Insta Bakes", website="instagram.com/instabakes",
+                osm_emails=["hi@instabakes.test"])
+
+    async def osm_with_banned(tags, bbox):
+        return json.loads(json.dumps([tvg, mail]))
+
+    fetched: list[str] = []
+
+    class RecordingFetcher(FakeFetcher):
+        async def fetch(self, url):
+            fetched.append(url)
+            return await super().fetch(url)
+
+    geo.find_businesses, lead_finder.PoliteFetcher = osm_with_banned, RecordingFetcher
+    try:
+        out = await lead_finder.find_leads({"icp": dict(ICP, search_queries=[]), "limit": 10})
+    finally:
+        geo.find_businesses, lead_finder.PoliteFetcher = fake_find_businesses, FakeFetcher
+    every = {x["name"]: x for x in out["leads"] + out["call_list"]}
+    check(every.get("TVG Amer Restaurant", {}).get("website", "?") is None and "TVG Amer Restaurant" not in
+          [x["name"] for x in out["leads"]] and every.get("Insta Bakes", {}).get("website", "?") is None
+          and every["Insta Bakes"]["website_source"] is None and not any(is_banned(u) for u in fetched)
+          and any("Ignored 2 OpenStreetMap website" in n for n in out["source_notes"]),
+          "finder: OSM website tags on banned hosts (zomato, instagram) are dropped, never shown or crawled")
 
 
 def timeout_unit_tests():
@@ -566,7 +602,7 @@ def _scripted(*replies):
     """A fake llm.draft_email returning `replies` in order (an Exception instance is raised)."""
     calls: list[dict] = []
 
-    async def fake(profile, lead, qualification, style_rules, problems=None):
+    async def fake(profile, lead, qualification, style_rules, problems=None, **_kw):
         calls.append({"lead": lead["id"], "problems": problems})
         reply = replies[min(len(calls), len(replies)) - 1]
         if isinstance(reply, Exception):
@@ -628,14 +664,14 @@ async def copywriter_unit_tests():
     check(len(calls) == 2 and d["warnings"] and "Bean Co" not in d["body_text"],
           "copywriter: regenerate error -> first draft kept with its warnings")
 
-    async def per_lead(profile, lead, qualification, style_rules, problems=None):
+    async def per_lead(profile, lead, qualification, style_rules, problems=None, **_kw):
         if lead["id"] == "broken":
             raise ValueError("LLM did not return JSON")
         return dict(GOOD)
 
     seen: list[str] = []
 
-    async def recording(profile, lead, qualification, style_rules, problems=None):
+    async def recording(profile, lead, qualification, style_rules, problems=None, **_kw):
         seen.append(lead["id"])
         return await per_lead(profile, lead, qualification, style_rules, problems)
 
@@ -645,11 +681,134 @@ async def copywriter_unit_tests():
     check([x["lead_id"] for x in out["drafts"]] == ["tapri"] and skipped == {"broken": "llm_failed", "nomail": "no_contact"}
           and "nomail" not in seen, f"copywriter: LLM failure / no contact -> skipped, others still drafted ({skipped})")
 
+    await copywriter_live_fix_tests(args)
+
     try:
         await copywriter.draft_emails({"profile": PROFILE})
         check(False, "copywriter: missing leads raises ValueError")
     except ValueError:
         check(True, "copywriter: missing leads raises ValueError")
+
+
+class LogCapture(logging.Handler):
+    def __init__(self):
+        super().__init__(logging.WARNING)
+        self.lines: list[str] = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+
+async def copywriter_live_fix_tests(args: dict):
+    """Live run: 2 of 3 leads 'failed' with no ASI:One request logged = their calls outlived the 25 s timeout."""
+    leads = [_lead("umaid"), _lead("marc"), _lead("halflight")]
+    contacts = [{"lead_id": "umaid", "email": "info@umaidmahal.test", "confidence": "medium", "source": "website"},
+                {"lead_id": "marc", "email": "hotelmarcinn@gmail.com", "confidence": "low", "source": "website"},
+                {"lead_id": "halflight", "email": "info@halflight.test", "confidence": "low", "source": "osm"}]
+    live = dict(args, leads=leads, contacts=contacts, reviews=[])
+    started: list[str] = []
+
+    async def slow(profile, lead, qualification, style_rules, problems=None, **_kw):
+        started.append(lead["id"])
+        await asyncio.sleep(0.05 if lead["id"] == "umaid" else 0.3)  # ASI:One answers some calls slower
+        return dict(GOOD, hook_used=None)
+
+    capture = LogCapture()
+    copywriter.log.addHandler(capture)
+    saved_timeout = copywriter.LLM_TIMEOUT_S
+    try:
+        copywriter.LLM_TIMEOUT_S = 0.15  # the old, too-short budget (scaled down)
+        out = await _draft_with(slow, live)
+        skipped = {s["lead_id"]: s.get("detail") for s in out["skipped"]}
+        check(sorted(started) == ["halflight", "marc", "umaid"] and [d["lead_id"] for d in out["drafts"]] == ["umaid"]
+              and skipped == {"marc": "timed out after 0.15s", "halflight": "timed out after 0.15s"}
+              and sum("timed out after 0.15s" in line for line in capture.lines) == 2,
+              f"copywriter: reproduces the live failure - slow LLM calls hit the timeout, the detail says so and is "
+              f"logged as a warning ({skipped})")
+        copywriter.LLM_TIMEOUT_S = 1
+        out = await _draft_with(slow, live)
+        check(sorted(d["lead_id"] for d in out["drafts"]) == ["halflight", "marc", "umaid"] and not out["skipped"]
+              and {d["to"] for d in out["drafts"]} == {c["email"] for c in contacts},
+              "copywriter: low-confidence contacts (free-mail, OSM tag) still get a draft (approval is a send-time rule)")
+    finally:
+        copywriter.LLM_TIMEOUT_S = saved_timeout
+        copywriter.log.removeHandler(capture)
+    check(copywriter.LLM_TIMEOUT_S >= 60 and copywriter.DRAFT_CONCURRENCY >= lead_finder.MAX_LIMIT
+          and copywriter.LLM_TIMEOUT_S * 2 < orchestrator.SPECIALISTS["draft_emails"][1],
+          f"copywriter: per-call LLM timeout ({copywriter.LLM_TIMEOUT_S:g}s) fits a live call; one wave x 2 attempts "
+          "fits the draft_emails timeout")
+
+    seen: dict = {}
+
+    async def recording(profile, lead, qualification, style_rules, problems=None, product="", brief=""):
+        seen.update(product=product, brief=brief)
+        return dict(GOOD)
+
+    await _draft_with(recording, dict(args, brief="I sell organic coffee beans"))
+    check(seen == {"product": ICP["product"], "brief": "I sell organic coffee beans"},
+          "copywriter: passes the ICP product and the user's brief to llm.draft_email")
+
+    real = original_load_profile()  # config/brand_profile.yaml, still all ❓
+    said = "organic coffee beans; I sell organic coffee beans - find cafés in Jaipur"
+    invented = dict(GOOD, body_text=GOOD["body_text"].replace(
+        "Want a free sample?", "We supply organic single-origin coffee beans, fresh-roasted. Want a free sample?"))
+    problems = copywriter.validate(invented, real, REVIEW, said)
+    flagged = [p for p in problems if "never say so" in p]
+    check(len(flagged) == 2 and any('"single origin"' in p for p in flagged) and any('"fresh roasted"' in p for p in flagged),
+          f"copywriter: validator flags product claims not in the brief/profile ({flagged})")
+    check(not [p for p in copywriter.validate(GOOD, PROFILE, REVIEW, said) if "never say so" in p]
+          and copywriter.unsupported_claims("our organic beans", "", PROFILE, REVIEW) == []
+          and copywriter.unsupported_claims("our organic beans", "", real, REVIEW) == ["organic"],
+          "copywriter: claims in the brief or filled-in profile pass; ❓ profile text never counts as a source")
+
+    sent: dict = {}
+
+    async def capture_json(system, user, max_tokens=1200, web_search=False):
+        sent.update(system=system, user=user)
+        return {}
+
+    llm.complete_json, original = capture_json, llm.complete_json
+    try:
+        await real_draft_email(real, _lead("tapri"), REVIEW, [], product="organic coffee beans",
+                               brief="I sell organic coffee beans - find cafés in Jaipur")
+    finally:
+        llm.complete_json = original
+    system = sent.get("system", "")
+    unknown_line = next((x for x in system.splitlines() if x.startswith("UNKNOWN")), "")
+    check("❓" not in system and "e.g. organic single-origin" not in system and "organic coffee beans" in system
+          and all(f in unknown_line for f in ("brand.name", "brand.sender_name", "offer.product", "offer.value_props"))
+          and UNSUB in system and "Would a 15-minute call" in system,
+          "llm.draft_email: ❓ profile fields are sent as explicitly unknown (never as text); brief + known facts kept")
+
+
+def card_cap_tests():
+    rows = [{"label": f"{i}. Lead {i}", "value": "x"} for i in range(1, 19)]
+    msg = cards.review_card("18 contacts found", rows, "contacts", "Approve")
+    payload = json.loads(card_meta(msg)["card_payload"])
+    check(payload["title"] == "18 contacts found (showing 15 of 18)" and len(payload["summary_rows"]) == 15
+          and "showing 15 of 18" in text_of(msg) and "15. Lead 15" in text_of(msg) and "16. Lead 16" not in text_of(msg),
+          "cards: a capped review card says 'showing 15 of N'")
+    leads = [{"id": f"l{i}", "name": f"Lead {i}"} for i in range(6)]
+    c = {"leads": leads, "contacts": [{"lead_id": f"l{i // 3}", "email": f"e{i}@x.test", "confidence": "medium"}
+                                      for i in range(18)]}
+    msg = orchestrator.checkpoint("contacts", c)
+    text = text_of(msg)
+    check("18 contacts found (showing 15 of 18)" in text and len(c["last_list"]) == 18
+          and f"15. Lead {c['last_list'][14][1:]}" in text,
+          "contacts card: 'showing 15 of 18', and row N is still last_list[N-1] for 'remove N'")
+
+
+def orchestrator_log_tests():
+    capture = LogCapture()
+    ctx = type("Ctx", (), {"logger": logging.getLogger("mock-orchestrator-log")})()
+    ctx.logger.addHandler(capture)
+    ctx.logger.propagate = False
+    orchestrator.log_draft_skips(ctx, {"skipped": [
+        {"lead_id": "osm:node/9", "reason": "llm_failed", "detail": f"AuthenticationError: bad key {os.environ['ASI1_API_KEY']}"},
+        {"lead_id": "osm:node/8", "reason": "no_contact"}]})
+    check(len(capture.lines) == 2 and "osm:node/9 (llm_failed): AuthenticationError" in capture.lines[0]
+          and os.environ["ASI1_API_KEY"] not in " ".join(capture.lines),
+          f"orchestrator: draft skips logged as warnings with their detail, secrets redacted ({capture.lines})")
 
 
 @user.on_event("startup")
@@ -704,6 +863,9 @@ async def run_script(ctx: Context):
         check(msg is not None and camp()["state"] == st.AWAIT_DRAFTS and len(drafts) == 1
               and drafts[0]["to"] == "owner@brewlab.test" and drafts[0]["warnings"] == []
               and drafts[0]["hook_used"] == "Takes orders by email", "draft card shown: primary contact, valid draft")
+        check(draft_calls and draft_calls[-1]["product"] == ICP["product"]
+              and "organic coffee beans" in draft_calls[-1]["brief"],
+              "orchestrator sends the brief + ICP product to the copywriter")
         no_contact = [x["name"] for x in camp()["leads"] if x["id"] != "web:brew-lab-roasters"]
         check(msg is not None and bool(no_contact)
               and all(f"{name} (no email found)" in text_of(msg).split("\n")[0] for name in no_contact),

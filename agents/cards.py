@@ -71,6 +71,8 @@ def settings_form(settings: dict) -> ChatMessage:
 
 def review_card(title: str, rows: list[dict], step: str, approve_label: str, reject_label: str = "Redo",
                 intro: str = "", extra_hint: str = "") -> ChatMessage:
+    if len(rows) > MAX_ROWS:  # rows keep their 1-based numbers, so "remove N" still matches what is shown
+        title = f"{title} (showing {MAX_ROWS} of {len(rows)})"
     rows = rows[:MAX_ROWS]
     payload = {
         "title": title,

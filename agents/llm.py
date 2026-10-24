@@ -174,24 +174,63 @@ async def qualify(icp: dict, lead: dict, signals: dict, page_text: str) -> dict:
     return await complete_json(system, user, max_tokens=800)
 
 
-DRAFT_PROMPT = """You write a short, respectful first email from {sender_name} ({brand}) to a local business. \
+DRAFT_PROMPT = """You write a short, respectful first email from a brand to a local business.
+What the brand sells, in the user's own words: {product}
+Known brand facts (JSON): {facts}
+UNKNOWN brand facts (never guess, invent or fill in; just leave them out): {unknown}
 Rules: <= {max_words} words; subject <= 8 words, no clickbait or ALL CAPS; open with ONE specific observation from \
-the hook (paraphrase, don't exaggerate); connect it to the offer: {offer}; social proof only as allowed: \
-{social_proof}; price only if allowed: {pricing}; one call to action: {cta}; sign with real name, brand and phone; \
-end with this exact line: "{unsubscribe_line}". Language: {language}. Follow these user style rules: {style_rules}. \
+the qualification hooks (paraphrase, don't exaggerate); with no hooks, don't claim anything about the business and \
+use "hook_used": null. Describe the product ONLY with the user's wording above and the known facts: never add \
+qualities, origins, processes, certifications, awards, customer numbers or service promises (e.g. "single-origin", \
+"fresh-roasted", "small-batch", "custom wholesale supply") that are not written there. Social proof and price only \
+if the known facts allow it. One call to action: {cta}. Sign with the sender name, brand and phone only where they \
+are known facts. {unsubscribe_rule}Language: {language}. Follow these user style rules: {style_rules}. \
 Never invent facts, numbers, names or features. Reply ONLY with JSON: \
 {{"subject": "...", "body_text": "...", "hook_used": "... or null"}}"""
 
 
+def _unknown(value) -> bool:
+    return value is None or "❓" in str(value) or not str(value).strip()
+
+
+def known_facts(value, path: str = "", unknown: list[str] | None = None):
+    """-> (value with every ❓/empty field removed, dotted paths of the removed fields). Lists/dicts recurse."""
+    unknown = [] if unknown is None else unknown
+    if isinstance(value, dict):
+        kept = {}
+        for k, v in value.items():
+            sub, _ = known_facts(v, f"{path}.{k}" if path else str(k), unknown)
+            if sub not in (None, {}, []):
+                kept[k] = sub
+        return kept, unknown
+    if isinstance(value, list):
+        inner: list[str] = []
+        kept = [known_facts(v, path, inner)[0] for v in value]
+        kept = [v for v in kept if v not in (None, {}, [])]
+        if inner:
+            unknown.append(path)
+        return kept, unknown
+    if isinstance(value, str) and _unknown(value):
+        unknown.append(path)
+        return None, unknown
+    return value, unknown
+
+
 async def draft_email(profile: dict, lead: dict, qualification: dict, style_rules: list[str],
-                      problems: list[str] | None = None) -> dict:
-    """`problems` = what the copywriter's validator rejected in the previous attempt (regenerate once)."""
-    b, e = profile.get("brand", {}), profile.get("email", {})
+                      problems: list[str] | None = None, product: str = "", brief: str = "") -> dict:
+    """`problems` = what the copywriter's validator rejected in the previous attempt (regenerate once).
+    `product` (the approved ICP product) and `brief` (the user's own words) are the only product wording allowed;
+    ❓/empty brand-profile fields are sent as explicitly unknown, never as text the model could reuse."""
+    facts, unknown = known_facts({k: v for k, v in profile.items() if k != "targeting"})
+    e, cta = facts.get("email", {}), facts.get("cta", {})
+    said = "; ".join(x for x in (str(product or "").strip(), str(brief or "").strip()) if x)
+    unsubscribe = e.get("unsubscribe_line")
     system = DRAFT_PROMPT.format(
-        sender_name=b.get("sender_name"), brand=b.get("name"), max_words=e.get("max_words", 150),
-        offer=json.dumps(profile.get("offer", {}), ensure_ascii=False), social_proof=profile.get("social_proof"),
-        pricing=profile.get("pricing"), cta=profile.get("cta", {}).get("text"),
-        unsubscribe_line=e.get("unsubscribe_line"), language=e.get("language", "English"), style_rules=style_rules,
+        product=json.dumps(said or "unknown - describe the offer only with the known facts", ensure_ascii=False),
+        facts=json.dumps(facts, ensure_ascii=False), unknown=", ".join(unknown) or "none",
+        max_words=e.get("max_words", 150), cta=cta.get("text") or "ask if a short call would be useful",
+        unsubscribe_rule=f'End with this exact line: "{unsubscribe}". ' if unsubscribe else "",
+        language=e.get("language", "English"), style_rules=style_rules,
     )
     payload = {"lead": lead, "qualification": qualification}
     if problems:

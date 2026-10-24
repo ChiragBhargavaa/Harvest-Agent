@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +61,25 @@ def text_of(msg: ChatMessage) -> str:
 
 def env_bool(name: str, default: bool = True) -> bool:
     return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_seconds(name: str, default: float) -> float:
+    """A positive number of seconds from the environment; missing, invalid or <= 0 -> default."""
+    try:
+        value = float(os.getenv(name, "") or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def redact(text: str) -> str:
+    """Strip API keys / bearer tokens from error text before it is logged or stored."""
+    text = str(text)
+    for name in ("ASI1_API_KEY", "RESEND_API_KEY", "FOURSQUARE_API_KEY", "GOOGLE_PLACES_API_KEY"):
+        secret = os.getenv(name, "").strip()
+        if len(secret) >= 8:
+            text = text.replace(secret, "***")
+    return re.sub(r"(?i)\b(sk-|bearer\s+)[\w.-]{6,}", r"\1***", text)
 
 
 def require_env(name: str) -> str:
