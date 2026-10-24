@@ -292,7 +292,7 @@ timeout, bad JSON), goes to `skipped`: the copywriter never writes a draft witho
 24 Oct 2026: a 25 s timeout cancelled 2 of 3 calls in flight; httpx logs a request only once it is answered, so no
 request appeared in the log.) The orchestrator stores `skipped` as `draft_skipped` and names those leads on the first
 draft card.
-**`send_emails`** (stretch)
+**`send_emails`** (stretch; not implemented — out of scope for the submission, the shell replies `ok=False`)
 ```jsonc
 {"campaign_id": "c_...", "drafts": [Draft], "dry_run": true, "redirect_to": "test@example.com", "daily_cap": 5}
 → {"queued": ["lead_id"], "sent": [{"lead_id": "...", "provider_id": "..."}], "skipped": [{"lead_id": "...", "reason": "suppressed|cap|low_confidence_unapproved"}]}
@@ -412,10 +412,19 @@ return the draft with the remaining problems as `warnings` (a failing regenerate
    Tags read: `name`, `name:en`, `website`, `contact:website`, `email`, `contact:email`, `phone`, `contact:phone`, `addr:*`.
    **Measured 24 Oct 2026:** Jaipur `amenity=cafe` in the city bbox → 86 businesses, 8 with a website, 2 with an email, 11 with a phone.
    OSM coverage of websites is thin, which is why source 3 exists.
-3. **ASI:One LLM web search** ⚠️ (quality unmeasured until `scripts/probe_sources.py` runs with a key): discovers extra businesses
+3. **ASI:One LLM web search** ✅ (probed 24 Oct 2026, below): discovers extra businesses
    and official websites. Output is **candidates only**; `lead_finder._verify_websites` crawls each candidate and keeps it only if the
    page loads and `crawl.name_matches` finds the business name. Web-only businesses without a verified site are dropped.
-4. **User-provided:** `add_lead` / `import_list` (M5).
+4. **User-provided:** `add_lead` / `import_list` (M5) — not part of this demo yet.
+
+**Lead-source probe (`scripts/probe_sources.py`, 24 Oct 2026)** ✅
+| Query | OSM (businesses / website / email / phone) | Web search (businesses / with URL / verified) | Result |
+|---|---|---|---|
+| Jaipur cafe | 86 / 8 / 2 / 11 | 38 / 13 / 12 | GO |
+| Jodhpur salon (`shop=hairdresser` + `shop=beauty`) | 6 / 0 / 0 / 1 | 29 / 7 / 7 (4 unique) | GO |
+| Jodhpur barber (no OSM tag mapped for "barber") | — | 20 / 4 / 3 | GO |
+
+**Decision:** `ASI1_WEB_SEARCH` stays on.
 5. **Optional later:** `FOURSQUARE_API_KEY` (Foursquare Places; free tier 500 calls/month per the official pricing page ⚠️) or
    `GOOGLE_PLACES_API_KEY` (Places API (New) Text Search, `X-Goog-FieldMask` with `places.websiteUri,places.nationalPhoneNumber` =
    Enterprise SKU; only `place_id` may be stored long-term; show "Google Maps" attribution).
@@ -493,19 +502,20 @@ agents/
   contact_finder.py  find_contacts                                        ✅ M2 logic
   lead_analyst.py    qualify_leads                                        ✅ M3 logic
   copywriter.py      draft_emails + validator                             ✅ M4 logic
-  sender.py          send_emails (shell → M6, stretch)
+  sender.py          send_emails (shell: replies "not implemented yet"; M6 out of scope)
   mock_test.py       offline end-to-end test (mocked LLM + OSM + fetch)
   local_test.py      live loop: all agents + interactive fake user (real LLM/network)
   profiles/*.md      Agentverse profile READMEs (badges + keywords)
 config/brand_profile.yaml
 scripts/probe_sources.py   go/no-go check for OSM + ASI:One web search
+scripts/run_all.py         supervisor: runs the 6 agents as subprocesses, restarts any that exit
 pyproject.toml, uv.lock, requirements.txt (exported for deploys), setup.sh
 ```
 Shared modules are fine for mailbox agents run from this repo. If an agent moves to an **Agentverse hosted** agent, inline its
 helpers into one file (§4.7).
 
 ### 3.18 Milestones and acceptance tests
-**Mock test** ✅ (`agents/mock_test.py`, 107 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
+**Mock test** ✅ (`agents/mock_test.py`, 110 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
 fetcher and `mx_ok` are monkeypatched; all agents + a scripted user run in a `Bureau(port=8010)`; exit code 0 = pass.
 
 | Milestone | Done when |
@@ -518,6 +528,9 @@ fetcher and `mx_ok` are monkeypatched; all agents + a scripted user run in a `Bu
 | **M5** Gates | Settings form + NL toggle gates; auto-approve logs `ai_auto`; pause/resume mid-flow; add_lead/import_list |
 | **M6** Sender (stretch) | DRY_RUN + TEST_REDIRECT_TO deliver to the test inbox; cap/window/suppression enforced |
 | **M7** Ship | All agents deployed (not a laptop), profiles filled, shared chat URL captured, README table complete, video, submitted |
+
+**M5 and M6 are out of scope for the submission:** the sender stays a DRY_RUN-only placeholder, and `add_lead` /
+`import_list` / `classify_reply` are answered "not part of this demo yet".
 
 ### 3.19 Demo script (3–4 min)
 1. **(20 s)** Problem: "Small brands selling to local businesses spend days finding leads; AI tools spam."
@@ -549,7 +562,7 @@ fetcher and `mx_ok` are monkeypatched; all agents + a scripted user run in a `Bu
 
 ### 4.1 Versions and environment
 - **Packages:** `uagents==0.26.1` (8 Oct 2026), `uagents-core==0.4.12` (13 Oct 2026). ✅ Installed with `uv sync` and tested (mock test). 0.26 adds `on_schedule`, event telemetry (`report_events=True` by default) and an experimental health protocol.
-- **Tooling:** `uv` (`uv sync`, `uv run`), lockfile `uv.lock`; `requirements.txt` is exported with `uv export --no-hashes --no-dev --no-emit-project` for Render.
+- **Tooling:** `uv` (`uv sync`, `uv run`), lockfile `uv.lock`; `requirements.txt` is exported with `uv export --no-hashes --no-dev --no-emit-project` for pip-based installs.
 - **Protocols:** Chat Protocol `AgentChatProtocol 0.3.0` ✅; Payment Protocol `AgentPaymentProtocol 0.1.0` ✅.
 - **Python:** 3.10–3.13. 3.13 tested OK ✅. Another Fetch-A-Thon team's README says 3.14 isn't supported yet ⚠️.
 - **Models:** `uagents_core.models.Model` subclasses **`pydantic.v1.BaseModel`**. ✅
@@ -726,12 +739,7 @@ agent.include(pay_proto, publish_manifest=True)
 - **MCP servers:** Agentverse full `https://mcp.agentverse.ai/sse`, lite `https://mcp-lite.agentverse.ai/mcp`.
 
 ### 4.8 Deployment (agents must stay online until results on 28 Oct)
-- **Render:** the Innovation Lab guide uses a **Background Worker** (no HTTP server needed for mailbox agents):
-  - build: `pip install -r requirements.txt`
-  - start: `python <agent>.py`
-  - env vars set in the dashboard; then open the Inspector link from the logs to connect the mailbox.
-  - ⚠️ Check Render pricing: background workers may not be on the free plan.
-- **Alternatives:** Railway, or a small VPS running all agents with a process manager (one process per agent; ports 8001–8006).
+- Run `python scripts/run_all.py` on any always-on machine with the same `.env` (same seeds keep the addresses).
 - **Seeds must match** what was registered, otherwise the addresses change and the README, profiles and env all break.
 - **After deploying,** re-run the full ASI:One flow and capture the **shared chat URL** from the deployed agents.
 
@@ -743,15 +751,21 @@ agent.include(pay_proto, publish_manifest=True)
 ---
 
 ## 5. Repo state (24 Oct 2026)
-- **M0 done:** all files in §3.17 exist; the 6 agents boot; `agents/mock_test.py` passes (20 checks) ✅.
-- **Implemented:** orchestrator (intent, gates, cards, pause/resume, settings, retry/skip, audit log), `find_leads`
-  (OSM + web search + verification), `find_contacts` (polite crawl + extraction + MX, mock-tested only), `qualify_leads`
-  (crawl + signals + LLM hooks filtered against page text, signals-only fallback; mock-tested only), `draft_emails`
-  (LLM drafts + deterministic validator, regenerate once, warnings; mock-tested only), orchestrator `edit_draft`
-  (per-draft edits, general edits → style rules after confirmation), crawler, geo, all LLM prompts.
-- **Shells (return `ok=False, "not implemented yet"`):** `send_emails` (M6). `add_lead` / `import_list` / `classify_reply`
-  are answered "coming soon" (M5).
-- **Not yet done by Chirag:** `ASI1_API_KEY` in `.env`, run `setup.sh`, `scripts/probe_sources.py`, mailbox connection, Agentverse profiles.
+- **Feature freeze for the submission:** M0–M4 done; M5 and M6 out of scope. `agents/mock_test.py` passes (**110 checks**) ✅;
+  `ruff check agents scripts` is clean.
+- **Implemented (5 of 6 agents):**
+  - orchestrator: intent, ICP, gates, cards, pause/resume, settings, retry/skip, audit log, `edit_draft` (per-draft edits;
+    general edits → style rules after confirmation);
+  - `find_leads`: OSM + concurrent web search + website verification;
+  - `find_contacts`: polite crawl + extraction + MX;
+  - `qualify_leads`: crawl + signals + LLM hooks filtered against page text, signals-only fallback;
+  - `draft_emails`: LLM drafts + deterministic validator, regenerate once, warnings;
+  - plus the crawler, geo, all LLM prompts and `scripts/run_all.py` (supervisor for all 6 agents).
+- **Not part of this demo:** `send_emails` is a shell (replies `ok=False, "not implemented yet"`, so the send step offers
+  retry/skip and nothing is sent; `DRY_RUN=true`). `add_lead` / `import_list` / `classify_reply` are answered
+  "not part of this demo yet".
+- **Lead sources probed live:** GO for Jaipur cafe, Jodhpur salon and Jodhpur barber (§3.13); web search stays on.
+- **Still open (placeholders in `README.md`):** Agentverse profile URLs, ASI:One shared chat URL, demo video.
 - The earlier generic starter (`specialist.py`/`page_check`) was folded into `common.make_specialist` and `lead_analyst.site_signals`.
 
 ---
