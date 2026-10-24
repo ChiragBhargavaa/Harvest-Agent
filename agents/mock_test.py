@@ -1008,6 +1008,118 @@ for a in (orchestrator.agent, lead_finder.agent, contact_finder.agent, lead_anal
           sender.agent, user):
     bureau.add(a)
 
+
+# ---------------- payment protocol (seller) — offline, fake context; runs before the Bureau starts ----------------
+
+class FakePayCtx:
+    def __init__(self, fail_send: bool = False):
+        self.sent: list[tuple[str, object]] = []
+        self.fail_send = fail_send
+        self.data: dict = {}
+        self.storage = type("S", (), {"get": lambda s, k: self.data.get(k), "has": lambda s, k: k in self.data,
+                                      "set": lambda s, k, v: self.data.__setitem__(k, v),
+                                      "remove": lambda s, k: self.data.pop(k, None)})()
+        self.logger = logging.getLogger("mock-payments")
+        self.agent = type("A", (), {"address": orchestrator.agent.address})()
+
+    async def send(self, to, msg):
+        if self.fail_send:
+            raise RuntimeError("network down")
+        self.sent.append((to, msg))
+
+    def of(self, cls) -> list:
+        return [m for _, m in self.sent if isinstance(m, cls)]
+
+
+async def payment_tests():
+    from uagents_core.contrib.protocols.payment import (
+        CancelPayment,
+        CommitPayment,
+        CompletePayment,
+        Funds,
+        RejectPayment,
+        RequestPayment,
+    )
+
+    import payments
+
+    buyer = "agent1qbuyer"
+    check(orchestrator.FAST_INTENTS.get("buy lead pack") == "buy_lead_pack"
+          and payments.pay_proto.digest in orchestrator.agent.protocols,
+          "payments: orchestrator includes the seller Payment Protocol and the 'buy lead pack' intent")
+    pack_camp = dict(st.DEFAULT_CAMPAIGN, campaign_id="c_test", target={"city": "Jaipur"}, log=[],
+                     leads=[{"id": "l1", "name": "Brew Lab", "website": "https://brewlab.test"}],
+                     contacts=[{"lead_id": "l1", "email": "hello@brewlab.test", "role": "info",
+                                "source_url": "https://brewlab.test/contact"}],
+                     reviews=[{"lead_id": "l1", "fit_score": 80}])
+
+    ctx = FakePayCtx()
+    await payments.offer(ctx, buyer, dict(st.DEFAULT_CAMPAIGN, log=[]))
+    check(not ctx.of(RequestPayment) and "free" in text_of(ctx.sent[0][1]),
+          "payments: no contacts yet -> no payment request, free flow explained")
+
+    ctx = FakePayCtx()
+    ctx.data[st.storage_key(buyer)] = pack_camp
+    await payments.offer(ctx, buyer, pack_camp)
+    req = (ctx.of(RequestPayment) or [None])[0]
+    check(req is not None and req.accepted_funds[0].amount == "0.1" and req.accepted_funds[0].currency == "FET"
+          and req.recipient == orchestrator.agent.address and req.reference.startswith("leadpack-c_test-")
+          and pack_camp["log"][-1]["action"] == "requested" and pack_camp["state"] == st.IDLE,
+          "payments: 'buy lead pack' sends RequestPayment (0.1 FET to the agent), logged, campaign state untouched")
+
+    def commit(**kw) -> CommitPayment:
+        args = {"funds": Funds(amount="0.1", currency="FET"), "recipient": req.recipient,
+                "transaction_id": "tx-123", "reference": req.reference}
+        return CommitPayment(**{**args, **kw})
+
+    bad = FakePayCtx()
+    bad.data = dict(ctx.data)
+    await payments.on_commit(bad, buyer, commit(funds=Funds(amount="0.05", currency="FET")))
+    check(bool(bad.of(CancelPayment)) and not bad.of(CompletePayment) and "below" in bad.of(CancelPayment)[0].reason,
+          "payments: underpaid commit -> CancelPayment")
+    for label, kw in (("wrong currency", {"funds": Funds(amount="0.1", currency="USD")}),
+                      ("wrong recipient", {"recipient": "agent1qsomeoneelse"}),
+                      ("unknown reference", {"reference": "leadpack-forged"})):
+        bad = FakePayCtx()
+        bad.data = dict(ctx.data)
+        await payments.on_commit(bad, buyer, commit(**kw))
+        check(bool(bad.of(CancelPayment)) and not bad.of(CompletePayment), f"payments: {label} -> CancelPayment")
+
+    await payments.on_commit(ctx, buyer, commit())
+    done = ctx.of(CompletePayment)
+    pack = text_of(ctx.sent[-1][1])
+    log = ctx.data[st.storage_key(buyer)]["log"]
+    check(len(done) == 1 and done[0].transaction_id == "tx-123" and "DEMO" in pack
+          and "hello@brewlab.test" in pack and "https://brewlab.test/contact" in pack
+          and log[-1]["action"].startswith("completed (DEMO") and payments._pending_key(buyer) not in ctx.data,
+          "payments: valid commit -> CompletePayment + lead pack with sources, labelled DEMO, audit-logged")
+
+    await payments.on_commit(ctx, buyer, commit(transaction_id="tx-replay"))
+    check(len(ctx.of(CompletePayment)) == 1 and bool(ctx.of(CancelPayment)),
+          "payments: a second commit after completion is cancelled (no open request)")
+
+    ctx = FakePayCtx()
+    ctx.data[payments._pending_key(buyer)] = {"reference": "r"}
+    await payments.on_reject(ctx, buyer, RejectPayment(reason="too expensive"))
+    check(payments._pending_key(buyer) not in ctx.data and "free campaign" in text_of(ctx.sent[-1][1])
+          and ctx.data[st.storage_key(buyer)]["log"][-1]["action"] == "rejected",
+          "payments: RejectPayment handled gracefully and audit-logged")
+
+    broken = FakePayCtx(fail_send=True)
+    broken.data = {payments._pending_key(buyer): {"reference": "r"}}
+    try:
+        await payments.on_commit(broken, buyer, commit())
+        await payments.on_reject(broken, buyer, RejectPayment())
+        await payments.offer(broken, buyer, pack_camp)
+        check(True, "payments: handlers never raise (send failures swallowed)")
+    except Exception as err:  # noqa: BLE001
+        check(False, f"payments: handler raised {err!r}")
+
+
+_pay_loop = asyncio.new_event_loop()  # a private loop: the Bureau's loop is left untouched
+_pay_loop.run_until_complete(payment_tests())
+_pay_loop.close()
+
 if __name__ == "__main__":
     threading.Timer(150, lambda: (print("TIMEOUT", flush=True), os._exit(2))).start()
     bureau.run()
