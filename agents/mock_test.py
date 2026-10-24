@@ -275,6 +275,7 @@ async def unit_tests():
 
     await finder_unit_tests()
     await banned_osm_website_test()
+    dedupe_unit_tests()
     timeout_unit_tests()
     await contact_unit_tests()
     await analyst_unit_tests()
@@ -375,6 +376,39 @@ async def banned_osm_website_test():
           and every["Insta Bakes"]["website_source"] is None and not any(is_banned(u) for u in fetched)
           and any("Ignored 2 OpenStreetMap website" in n for n in out["source_notes"]),
           "finder: OSM website tags on banned hosts (zomato, instagram) are dropped, never shown or crawled")
+
+
+def dedupe_unit_tests():
+    def lead(lead_id, name, website=None, phone=None, osm_emails=None):
+        return {"id": lead_id, "name": name, "website": website, "website_source": "osm" if website else None,
+                "phone": phone, "osm_emails": osm_emails or [], "source": "osm"}
+
+    check(lead_finder._domain_key("https://www.Mollys.in:443/menu?x=1#top") == "mollys.in"
+          and lead_finder._domain_key("http://mollys.in") == "mollys.in"
+          and lead_finder._domain_key("mollys.in/about") == "mollys.in" and lead_finder._domain_key(None) is None,
+          "finder: _domain_key strips scheme, www., port, path, query and fragment")
+    notes: list[str] = []
+    out = lead_finder.dedupe_leads([
+        lead("a", "Molly's Kitchen", "https://www.Mollys.in/menu", osm_emails=["hi@mollys.in"]),
+        lead("b", "Mollys Bistro", "http://mollys.in", phone="+91 98290 11111", osm_emails=["book@mollys.in"]),
+        lead("c", "Brew Bros", "https://brewbros.in"),
+        lead("d", "The Brew Bros Cafe", "https://brewbros-jaipur.com"),
+        lead("e", "Brew Bros", None, phone="+91 98290 33333"),
+        lead("f", "Chai Point Corner", None, phone="+91 98290 44444"),
+        lead("g", "The Cafe", None),
+        lead("h", "Cafe", None),
+    ], notes)
+    by_id = {x["id"]: x for x in out}
+    check([x["id"] for x in out] == ["a", "c", "f", "g", "h"],
+          "finder: dedupe keeps the first lead per domain or normalised name; distinct businesses stay")
+    check(by_id["a"]["phone"] == "+91 98290 11111" and by_id["a"]["osm_emails"] == ["hi@mollys.in", "book@mollys.in"]
+          and by_id["a"]["website"] == "https://www.Mollys.in/menu" and by_id["c"]["phone"] == "+91 98290 33333",
+          "finder: kept lead gains the duplicate's phone and OSM emails, keeps its own website")
+    check(notes == ["Merged 3 duplicate lead(s) (same website domain or name)."],
+          "finder: one source note counts the merged duplicates")
+    quiet: list[str] = []
+    lead_finder.dedupe_leads([lead("x", "Alpha", "https://alpha.in"), lead("y", "Beta", None)], quiet)
+    check(quiet == [], "finder: no dedupe note when nothing was merged")
 
 
 def timeout_unit_tests():

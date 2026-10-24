@@ -13,6 +13,7 @@ Run:  python agents/lead_finder.py
 import asyncio
 import os
 import re
+from urllib.parse import urlsplit
 
 import geo
 import llm
@@ -33,6 +34,38 @@ def _norm_name(name: str) -> str:
 
 def _slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:60]
+
+
+def _domain_key(url: str | None) -> str | None:
+    """Lowercase host without scheme, "www.", port, path, query or fragment; None if no url."""
+    if not url:
+        return None
+    host = urlsplit(url if "//" in url else f"//{url}").hostname or ""
+    return host.removeprefix("www.") or None
+
+
+def dedupe_leads(leads: list[dict], notes: list[str]) -> list[dict]:
+    """Keep the first (best-ranked) lead per website domain or normalised name; merge the rest into it."""
+    kept: list[dict] = []
+    seen: dict[str, dict] = {}
+    for lead in leads:
+        keys = [k for k in (f"d:{_domain_key(lead.get('website')) or ''}", f"n:{_norm_name(lead.get('name') or '')}")
+                if k[2:]]
+        first = next((seen[k] for k in keys if k in seen), None)
+        if first is None:
+            first = lead
+            kept.append(lead)
+        else:  # copy only data the duplicate actually has
+            if not first.get("website") and lead.get("website"):
+                first["website"], first["website_source"] = lead["website"], lead.get("website_source")
+            if not first.get("phone") and lead.get("phone"):
+                first["phone"] = lead["phone"]
+            first["osm_emails"] = list(dict.fromkeys((first.get("osm_emails") or []) + (lead.get("osm_emails") or [])))
+        for k in keys:
+            seen.setdefault(k, first)
+    if merged := len(leads) - len(kept):
+        notes.append(f"Merged {merged} duplicate lead(s) (same website domain or name).")
+    return kept
 
 
 def _rank(lead: dict) -> int:
@@ -151,6 +184,7 @@ async def find_leads(args: dict) -> dict:
     await _verify_websites(shortlist, notes)
     shortlist = [lead for lead in shortlist if lead["source"] == "osm" or lead.get("website")]
     shortlist.sort(key=_rank, reverse=True)
+    shortlist = dedupe_leads(shortlist, notes)
 
     picked = [lead for lead in shortlist if lead.get("website") or lead.get("osm_emails")][:limit]
     call_list = [lead for lead in shortlist if lead not in picked and lead.get("phone")][:limit]
