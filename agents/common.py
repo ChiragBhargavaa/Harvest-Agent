@@ -4,6 +4,8 @@ import asyncio
 import json
 import os
 import re
+import sys
+import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +22,12 @@ from uagents_core.contrib.protocols.chat import (
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
+
+for _stream in (sys.stdout, sys.stderr):  # log lines show up immediately, even when piped (run_all, nohup)
+    try:
+        _stream.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):  # not a TextIOWrapper (e.g. replaced by a test harness)
+        pass
 
 
 # ---------- agent <-> agent messages (orchestrator -> specialists) ----------
@@ -147,16 +155,19 @@ def make_specialist(
         if fn is None:
             await ctx.send(sender, ToolResponse(ok=False, error=f"unknown tool '{req.tool}'"))
             return
+        start = time.monotonic()
         try:
             args = json.loads(req.args_json or "{}")
             result = await fn(args)
             await ctx.send(sender, ToolResponse(ok=True, result=json.dumps(result)))
+            ctx.logger.info(f"{req.tool} done in {time.monotonic() - start:.1f}s")
         except NotImplementedError as err:
             ctx.logger.warning(str(err))
             await ctx.send(sender, ToolResponse(ok=False, error=str(err)))
         except Exception as err:  # noqa: BLE001 - report every failure back to the orchestrator
-            ctx.logger.exception(f"{req.tool} failed")
-            await ctx.send(sender, ToolResponse(ok=False, error=f"{type(err).__name__}: {err}"[:400]))
+            error = redact(f"{type(err).__name__}: {err}")[:400]
+            ctx.logger.error(f"{req.tool} failed in {time.monotonic() - start:.1f}s: {error}")
+            await ctx.send(sender, ToolResponse(ok=False, error=error))
 
     agent.include(proto, publish_manifest=True)
 

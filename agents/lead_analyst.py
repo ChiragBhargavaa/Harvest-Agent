@@ -6,16 +6,21 @@ Hooks are kept only if their evidence snippet really appears on a crawled page (
 the evidence_url is set to the page it was found on. If the LLM fails (error, timeout, bad JSON, missing keys) the
 lead gets a deterministic signals-only review with `fallback: true`. Leads without a usable website get a
 signals-only review with `reachable: false` and an `unreachable_reason` (no LLM call: there is no evidence).
+The whole step gets ANALYST_BUDGET_S (env, default 90 s; the orchestrator waits 120 s): leads still being reviewed then
+are cancelled and get a minimal review (fit 0 = unknown, no hooks, `unreachable_reason: "timed_out"`, "Review timed out")
+so the flow continues with a partial result, never an error.
 
 Run:  python agents/lead_analyst.py
 """
 
 import asyncio
+import logging
 import re
+import time
 from datetime import date
 
 import llm
-from common import make_specialist
+from common import env_seconds, make_specialist
 from crawl import Page, PoliteFetcher, is_banned, normalise_url
 
 KEYWORDS = {
@@ -47,10 +52,13 @@ def site_signals(page: Page) -> dict:
     }
 
 
+NAME = "leadreach-analyst"
+log = logging.getLogger(NAME)  # the agent's own logger (uAgents names it after the agent)
 CRAWL_CONCURRENCY = 5
 MAX_PAGES = 5
 MAX_HOOKS = 3
-LLM_TIMEOUT_S = 60  # keeps the whole step inside the orchestrator's 300 s qualify_leads timeout
+LLM_TIMEOUT_S = 60  # per lead; the step as a whole is capped by ANALYST_BUDGET_S
+ANALYST_BUDGET_S = env_seconds("ANALYST_BUDGET_S", 90)  # stays below the orchestrator's 120 s qualify_leads timeout
 PAGE_TEXT_CHARS = 4000  # what llm.qualify sends
 MIN_EVIDENCE_CHARS = 10
 STOPWORDS = {"the", "and", "with", "for", "that", "has", "have", "are", "its", "their", "from", "into", "offers",
@@ -133,6 +141,12 @@ def supported_hooks(hooks, pages: list[Page], signals: dict) -> list[dict]:
 def _matches(phrase: str, text: str) -> bool:
     words = [w for w in re.findall(r"[a-z0-9]+", phrase.lower()) if len(w) > 2 and w not in STOPWORDS]
     return bool(words) and sum(w in text for w in words) >= max(1, (len(words) + 1) // 2)
+
+
+def timed_out_review(lead: dict) -> dict:
+    """A lead the step ran out of time for: fit unknown (0), no hooks, no claims."""
+    return {"lead_id": lead["id"], "reachable": False, "unreachable_reason": "timed_out", "signals": {},
+            "fit_score": 0, "hooks": [], "summary": "Review timed out; fit unknown.", "fallback": True}
 
 
 def signals_review(icp: dict, lead: dict, signals: dict, pages: list[Page]) -> tuple[int, str]:
@@ -219,6 +233,7 @@ async def qualify_leads(args: dict) -> dict:
     if not isinstance(icp, dict):
         raise ValueError("missing 'icp'")
     sem = asyncio.Semaphore(CRAWL_CONCURRENCY)
+    start = time.monotonic()
 
     async with PoliteFetcher() as fetcher:  # one fetcher: shared robots cache + per-domain rate limit
         async def one(lead: dict) -> dict:
@@ -229,12 +244,19 @@ async def qualify_leads(args: dict) -> dict:
                 return {"lead_id": lead["id"], "reachable": False, "unreachable_reason": "unreachable", "signals": {},
                         "fit_score": score, "hooks": [], "summary": summary, "fallback": True}
 
-        reviews = await asyncio.gather(*(one(lead) for lead in leads))
+        tasks = [asyncio.create_task(one(lead)) for lead in leads]
+        _, pending = await asyncio.wait(tasks, timeout=ANALYST_BUDGET_S)
+        for task in pending:  # over budget: return what we have
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+    reviews = [timed_out_review(lead) if task in pending else task.result() for lead, task in zip(leads, tasks, strict=True)]
+    log.info(f"qualify_leads done in {time.monotonic() - start:.1f}s: {len(reviews)} reviews, "
+             f"{sum(not r['fallback'] for r in reviews)} by the LLM, {len(pending)} timed out")
     return {"reviews": sorted(reviews, key=lambda r: -r["fit_score"])}  # best fit first (stable)
 
 
 agent = make_specialist(
-    name="leadreach-analyst",
+    name=NAME,
     seed_env="ANALYST_SEED",
     port_env="ANALYST_PORT",
     default_port=8004,

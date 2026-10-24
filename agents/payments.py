@@ -108,8 +108,8 @@ async def offer(ctx: Context, sender: str, camp: dict) -> None:
     """Chat intent "buy lead pack": send a RequestPayment. Logs into `camp` (the caller saves it). Never raises."""
     try:
         if not camp.get("contacts"):
-            await ctx.send(sender, chat_text("A lead pack needs verified contacts first: run a campaign to the contacts "
-                                             "step (free). Paying is optional and never needed for the free flow."))
+            await ctx.send(sender, chat_text("The lead pack is offered once leads and contacts are ready — "
+                                             "finish the contacts step first."))
             return
         req = lead_pack_request(ctx, camp)
         ctx.storage.set(_pending_key(sender), {"reference": req.reference, "amount": req.accepted_funds[0].amount,

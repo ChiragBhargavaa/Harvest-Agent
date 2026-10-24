@@ -240,9 +240,11 @@ class ToolResponse(Model):
 `reply, status = await ctx.send_and_receive(addr, ToolRequest(...), response_type=ToolResponse, timeout=T)` — ✅ verified in
 `agents/mock_test.py`; `reply` is `None` on timeout.
 
-**Per-tool timeouts (s):** `find_leads` 300 · `find_contacts` 300 · `qualify_leads` 300 · `draft_emails` 240 · `send_emails` 60
+**Per-tool timeouts (s):** `find_leads` 300 · `find_contacts` 90 · `qualify_leads` 120 · `draft_emails` 240 · `send_emails` 60
 (sized for live web search + polite crawling; override with `LEADREACH_TIMEOUT_<TOOL>`, §3.16). The progress text is sent
-before the call. Send **≤15 leads per request**.
+before the call. On a timeout the user sees "⚠ <Specialist> timed out — reply **retry** …" (`STEP_FAILED`; **retry** re-sends
+the same request, **skip** moves on). ASI:One prefixes user text with "@agent1… ": the orchestrator strips it before intent
+matching, and any text containing "lead pack" / "buy pack" is `buy_lead_pack` without an LLM call. Send **≤15 leads per request**.
 
 ### 3.7 Tool args and result schemas
 **`find_leads`** ✅ implemented
@@ -262,12 +264,15 @@ normalised name; a dropped duplicate's missing website/phone and its `osm_emails
 entry counts the merges.
 **`find_contacts`** ✅ implemented (M2)
 ```jsonc
-{"leads": [Lead], "max_pages_per_site": 5}
-→ {"contacts": [Contact], "skipped": [{"lead_id": "...", "reason": "no_website|banned_host|robots_disallowed|unreachable|no_email_found|mx_failed"}]}
+{"leads": [Lead], "max_pages_per_site": 3}
+→ {"contacts": [Contact], "skipped": [{"lead_id": "...", "reason": "no_website|banned_host|robots_disallowed|unreachable|no_email_found|mx_failed|timed_out"}]}
 ```
 A lead appears in `skipped` only if it ends up with no contact. Contacts are deduped per lead (best confidence wins) and
 sorted per lead: confidence, then primary-contact role. `phones` = all phones seen on the site plus the OSM phone tag.
-Leads are crawled concurrently (≤5 at a time, one shared `PoliteFetcher`); MX lookups run in a thread, once per domain.
+Leads are crawled concurrently (≤5 at a time, one shared `PoliteFetcher`, ≤3 pages per site); MX lookups run in a thread,
+once per domain, 5 s each: a timed-out lookup keeps the email with `mx_ok: null` (unverified) and confidence one level lower.
+The step has a `CONTACT_BUDGET_S` budget (default 50 s): unfinished leads are cancelled and skipped as `timed_out`
+(partial result, never an error).
 **`qualify_leads`** ✅ implemented (M3)
 ```jsonc
 {"icp": ICP, "leads": [Lead], "contacts": [Contact]}  →  {"reviews": [Review]}
@@ -279,6 +284,8 @@ plus `pages_crawled`) → `llm.qualify` (60 s timeout). A hook is kept only if i
 LLM failure (error, timeout, bad JSON, missing/invalid `fit_score` or `hooks`) → deterministic signals-only review,
 `fallback: true`, no hooks. No website or failed crawl → `reachable: false` + `unreachable_reason`
 (`no_website|banned_host|robots_disallowed|unreachable`), signals-only, no LLM call. `contacts` is accepted but not used yet.
+The step has an `ANALYST_BUDGET_S` budget (default 90 s): unfinished leads get a minimal review (`fit_score` 0 = unknown,
+no hooks, `unreachable_reason: "timed_out"`, summary "Review timed out; fit unknown.", `fallback: true`).
 **`draft_emails`** ✅ implemented (M4)
 ```jsonc
 {"profile": BrandProfile, "brief": "<the user's own words>", "style_rules": [], "icp": ICP, "leads": [Lead],
@@ -488,7 +495,8 @@ latest year seen, keyword flags (online ordering, menu, events, catering), app-s
 | `LEAD_FINDER_AGENT_ADDRESS`, `CONTACT_FINDER_AGENT_ADDRESS`, `LEAD_ANALYST_AGENT_ADDRESS`, `COPYWRITER_AGENT_ADDRESS`, `SENDER_AGENT_ADDRESS` | Derived: `Identity.from_seed(seed, 0).address` ✅ |
 | `FOURSQUARE_API_KEY`, `GOOGLE_PLACES_API_KEY` | Optional extra lead sources (unused unless set) |
 | `MAILBOX`, `OWNER_MODE`, `*_PORT` | Runtime (tests force `MAILBOX=false`) |
-| `LEADREACH_TIMEOUT_FIND_LEADS`, `_FIND_CONTACTS`, `_QUALIFY_LEADS`, `_DRAFT_EMAILS`, `_SEND_EMAILS` | Optional: seconds the orchestrator waits for each specialist (defaults 300/300/300/240/60; invalid or ≤0 → default) |
+| `LEADREACH_TIMEOUT_FIND_LEADS`, `_FIND_CONTACTS`, `_QUALIFY_LEADS`, `_DRAFT_EMAILS`, `_SEND_EMAILS` | Optional: seconds the orchestrator waits for each specialist (defaults 300/90/120/240/60; invalid or ≤0 → default) |
+| `CONTACT_BUDGET_S`, `ANALYST_BUDGET_S` | Optional: seconds the contact finder / lead analyst work before returning a partial result (defaults 50 / 90) |
 | `LEADREACH_WEB_SEARCH_TIMEOUT` | Optional: seconds per lead-finder web-search call (default 90) |
 | `LEADREACH_DRAFT_LLM_TIMEOUT` | Optional: seconds per copywriter `llm.draft_email` attempt (default 100; invalid or ≤0 → default) |
 | `RESEND_API_KEY`, `SENDER_FROM`, `REPLY_TO`, `DRY_RUN`, `TEST_REDIRECT_TO`, `DAILY_CAP` | Sending + safety defaults |
@@ -520,7 +528,7 @@ Shared modules are fine for mailbox agents run from this repo. If an agent moves
 helpers into one file (§4.7).
 
 ### 3.18 Milestones and acceptance tests
-**Mock test** ✅ (`agents/mock_test.py`, 139 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
+**Mock test** ✅ (`agents/mock_test.py`, 150 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
 fetcher and `mx_ok` are monkeypatched; all agents + a scripted user run in a `Bureau(port=8010)`; exit code 0 = pass.
 
 | Milestone | Done when |
@@ -769,7 +777,7 @@ agent.include(pay_proto, publish_manifest=True)
 ---
 
 ## 5. Repo state (24 Oct 2026)
-- **Feature freeze for the submission:** M0–M4 done; M5 and M6 out of scope. `agents/mock_test.py` passes (**139 checks**) ✅;
+- **Feature freeze for the submission:** M0–M4 done; M5 and M6 out of scope. `agents/mock_test.py` passes (**150 checks**) ✅;
   `ruff check agents scripts` is clean.
 - **Implemented (5 of 6 agents):**
   - orchestrator: intent, ICP, gates, cards, pause/resume, settings, retry/skip, audit log, `edit_draft` (per-draft edits;

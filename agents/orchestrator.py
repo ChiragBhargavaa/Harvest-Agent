@@ -26,14 +26,17 @@ import state as st
 from common import ROOT, ToolRequest, ToolResponse, ack, chat_text, env_bool, env_seconds, redact, require_env, text_of
 
 # tool -> (env var with the specialist address, default timeout seconds; override with LEADREACH_TIMEOUT_<TOOL>)
-# Sized for live ASI:One web search (~30-60 s per call) plus polite crawling (1 request/s per site).
+# Sized for live ASI:One web search (~30-60 s per call) plus polite crawling (1 request/s per site). The contact finder
+# and analyst cap their own work (CONTACT_BUDGET_S 50 s, ANALYST_BUDGET_S 90 s) and return partial results in time.
 SPECIALISTS = {
     "find_leads": ("LEAD_FINDER_AGENT_ADDRESS", 300),
-    "find_contacts": ("CONTACT_FINDER_AGENT_ADDRESS", 300),
-    "qualify_leads": ("LEAD_ANALYST_AGENT_ADDRESS", 300),
+    "find_contacts": ("CONTACT_FINDER_AGENT_ADDRESS", 90),
+    "qualify_leads": ("LEAD_ANALYST_AGENT_ADDRESS", 120),
     "draft_emails": ("COPYWRITER_AGENT_ADDRESS", 240),
     "send_emails": ("SENDER_AGENT_ADDRESS", 60),
 }
+SPECIALIST_NAMES = {"find_leads": "Lead Finder", "find_contacts": "Contact Finder", "qualify_leads": "Lead Analyst",
+                    "draft_emails": "Copywriter", "send_emails": "Sender"}
 GATE_TOOL = {"leads": "find_leads", "contacts": "find_contacts", "reviews": "qualify_leads",
              "drafts": "draft_emails", "send": "send_emails"}
 PROGRESS = {
@@ -52,7 +55,9 @@ FAST_INTENTS = {  # exact phrases handled without an LLM call
 }
 FAST_INTENTS.update(payments.FAST_INTENTS)  # "buy lead pack" / "unlock full list" (optional Payment Protocol demo)
 STYLE_RULE_DECLINE = {"no", "just this one", "just this draft", "only this one", "only this draft"}
-SKIP_REASONS = {"no_contact": "no email found", "llm_failed": "the writer failed"}
+SKIP_REASONS = {"no_contact": "no email found", "llm_failed": "the writer failed", "timed_out": "lookup timed out"}
+MENTION_RE = re.compile(r"^\s*@agent1[a-z0-9]+\s*", re.I)  # ASI:One prefixes "@agent1q... " to the user's text
+PACK_WORDS = ("lead pack", "buy pack")
 HELP = (
     "I'm **LeadReach**: I find local businesses that fit your brand, their published emails, evidence-based "
     "reasons to contact them, and draft personal emails - stopping for your approval at every step.\n\n"
@@ -97,6 +102,7 @@ def parse_card_action(text: str) -> dict | None:
 
 
 async def understand(text: str, camp: dict) -> dict:
+    text = MENTION_RE.sub("", text, count=1).strip()
     if cmd := parse_card_action(text):
         return cmd
     low = text.lower().strip(" .!")
@@ -111,6 +117,8 @@ async def understand(text: str, camp: dict) -> dict:
                 "confidence": 1.0}
     if m := re.fullmatch(r"show (?:lead|review)\s+(\d+)", low):
         return {"intent": "show_lead", "args": {"ids": [int(m.group(1))]}, "confidence": 1.0}
+    if any(w in low for w in PACK_WORDS):  # e.g. "can I buy the lead pack?" - any state, no LLM call
+        return {"intent": "buy_lead_pack", "args": {}, "confidence": 1.0}
     try:
         return await llm.parse_intent(text, camp["state"], st.pending_gate(camp), camp.get("last_list_names", []))
     except Exception:  # noqa: BLE001 - degrade to a clarifying question
@@ -136,7 +144,7 @@ async def call_tool(ctx: Context, tool: str, args: dict) -> tuple[dict | None, s
     except Exception as err:  # noqa: BLE001
         return None, f"could not reach the {tool} agent ({err})"
     if not isinstance(reply, ToolResponse):
-        return None, f"the {tool} agent did not answer within {timeout:g}s ({status})"
+        return None, f"{SPECIALIST_NAMES[tool]} timed out (no answer within {timeout:g}s, {status})"
     if not reply.ok:
         return None, reply.error or "unknown error"
     try:
@@ -227,7 +235,7 @@ def step_args(gate: str, camp: dict) -> dict:
     if gate == "leads":
         return {"icp": camp["icp"], "limit": camp["target"]["limit"], "exclude_ids": camp["removed_ids"]}
     if gate == "contacts":
-        return {"leads": camp["leads"], "max_pages_per_site": 5}
+        return {"leads": camp["leads"], "max_pages_per_site": 3}
     if gate == "reviews":
         return {"icp": camp["icp"], "leads": camp["leads"], "contacts": camp["contacts"]}
     if gate == "drafts":
@@ -273,7 +281,10 @@ async def run_from(ctx: Context, sender: str, camp: dict, gate: str) -> None:
             if result is None:
                 camp["state"], camp["failed_gate"] = st.STEP_FAILED, gate
                 st.log(camp, gate, "failed", "system", error)
+                name = SPECIALIST_NAMES[GATE_TOOL[gate]]
                 await ctx.send(sender, chat_text(
+                    f"⚠ {name} timed out — reply **retry** to try again, or **skip** to move on."
+                    if error.startswith(f"{name} timed out") else
                     f"⚠ The **{gate}** step failed: {error}\n\nReply **retry** to try again, or **skip** to move on."))
                 return
             if gate == "drafts":

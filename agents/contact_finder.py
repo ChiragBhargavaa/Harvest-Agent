@@ -10,13 +10,20 @@ Confidence (HACKATHON_README §3.8):
            (e.g. the web designer's) that appears on the business's site.
 Emails whose domain has no MX/A record are dropped. Leads with no usable email go to `skipped` with a reason.
 
+Time limits (the orchestrator waits 90 s): each MX lookup gets MX_TIMEOUT_S (5 s); on timeout the email is kept with
+`mx_ok: null` (unverified) and its confidence lowered one level (high -> medium -> low). The whole step gets
+CONTACT_BUDGET_S (env, default 50 s): leads still running then are cancelled and go to `skipped` with reason
+"timed_out"; the partial result is returned, never an error.
+
 Run:  python agents/contact_finder.py
 """
 
 import asyncio
+import logging
 import re
+import time
 
-from common import make_specialist
+from common import env_seconds, make_specialist
 from crawl import (
     EMAIL_RE,
     FAKE_EMAIL_HINTS,
@@ -31,8 +38,13 @@ from crawl import (
     normalise_url,
 )
 
+NAME = "leadreach-contacts"
+log = logging.getLogger(NAME)  # the agent's own logger (uAgents names it after the agent)
 CRAWL_CONCURRENCY = 5
-MAX_PAGES = 5
+MAX_PAGES = 3
+CONTACT_BUDGET_S = env_seconds("CONTACT_BUDGET_S", 50)  # whole step; stays below the orchestrator's 90 s
+MX_TIMEOUT_S = 5
+CONFIDENCES = ["high", "medium", "low"]
 # crawl.guess_role -> Contact.role (§3.8)
 ROLE_MAP = {"founder": "owner", "booking": "orders", "hello": "info", "support": "contact"}
 HIGH_ROLES = {"owner", "manager", "sales", "orders"}
@@ -125,11 +137,15 @@ async def _contacts_for(lead: dict, fetcher, sem: asyncio.Semaphore, mx_cache: d
             mx_cache[domain] = asyncio.ensure_future(asyncio.to_thread(mx_ok, domain))
     contacts = []
     for email, contact in best.items():
-        try:
-            ok = await mx_cache[email.split("@")[1]]
+        try:  # shield: the cached lookup stays usable for the domain's other emails after a timeout
+            ok = await asyncio.wait_for(asyncio.shield(mx_cache[email.split("@")[1]]), MX_TIMEOUT_S)
+        except asyncio.TimeoutError:  # slow DNS: keep the email, unverified, one confidence level lower
+            ok = None
+            contact = dict(contact, mx_ok=None, confidence=CONFIDENCES[
+                min(CONFIDENCE_RANK[contact["confidence"]] + 1, len(CONFIDENCES) - 1)])
         except Exception:  # noqa: BLE001 - DNS failure counts as no MX
             ok = False
-        if ok:
+        if ok is not False:
             contacts.append(dict(contact, phones=sorted(phones)))
     if not contacts:
         return [], "mx_failed"
@@ -147,6 +163,8 @@ async def find_contacts(args: dict) -> dict:
     sem = asyncio.Semaphore(CRAWL_CONCURRENCY)
     mx_cache: dict = {}
 
+    start = time.monotonic()
+
     async with PoliteFetcher() as fetcher:  # one fetcher: shared robots cache + per-domain rate limit
         async def one(lead: dict) -> tuple[list, str | None]:
             try:
@@ -154,18 +172,25 @@ async def find_contacts(args: dict) -> dict:
             except Exception:  # noqa: BLE001 - a per-lead failure never fails the whole step
                 return [], "unreachable"
 
-        results = await asyncio.gather(*(one(lead) for lead in leads))
+        tasks = [asyncio.create_task(one(lead)) for lead in leads]
+        _, pending = await asyncio.wait(tasks, timeout=CONTACT_BUDGET_S)
+        for task in pending:  # over budget: return what we have
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+    results = [([], "timed_out") if task in pending else task.result() for task in tasks]
 
     contacts, skipped = [], []
     for lead, (found, reason) in zip(leads, results, strict=True):
         contacts += found
         if reason and not found:
             skipped.append({"lead_id": lead["id"], "reason": reason})
+    log.info(f"find_contacts done in {time.monotonic() - start:.1f}s: {len(contacts)} contacts, {len(skipped)} skipped "
+             f"({len(pending)} timed out)")
     return {"contacts": contacts, "skipped": skipped}
 
 
 agent = make_specialist(
-    name="leadreach-contacts",
+    name=NAME,
     seed_env="CONTACT_SEED",
     port_env="CONTACT_PORT",
     default_port=8003,

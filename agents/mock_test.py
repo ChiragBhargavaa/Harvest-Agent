@@ -154,6 +154,8 @@ class FakeFetcher:
         try:
             await asyncio.sleep(0.05)
             domain = domain_of(url)
+            if domain.startswith("hang"):  # a site that never finishes (live: very slow crawl)
+                await asyncio.sleep(30)
             if domain.startswith("slow"):
                 return [_page(url, "no contact details")]
             if domain not in SITES:
@@ -278,7 +280,9 @@ async def unit_tests():
     dedupe_unit_tests()
     timeout_unit_tests()
     await contact_unit_tests()
+    await contact_budget_tests()
     await analyst_unit_tests()
+    await analyst_budget_tests()
     await copywriter_unit_tests()
     card_cap_tests()
     orchestrator_log_tests()
@@ -445,8 +449,12 @@ def timeout_unit_tests():
     check(seen == {None: 300, "450": 450, "abc": 300, "0": 300},
           f"orchestrator: find_leads timeout 300 s by default, LEADREACH_TIMEOUT_FIND_LEADS overrides it ({seen})")
     check({t: d for t, (_, d) in orchestrator.SPECIALISTS.items()} ==
-          {"find_leads": 300, "find_contacts": 300, "qualify_leads": 300, "draft_emails": 240, "send_emails": 60},
+          {"find_leads": 300, "find_contacts": 90, "qualify_leads": 120, "draft_emails": 240, "send_emails": 60},
           "orchestrator: default specialist timeouts sized for live web search + crawling")
+    check(contact_finder.CONTACT_BUDGET_S == 50 < orchestrator.SPECIALISTS["find_contacts"][1]
+          and lead_analyst.ANALYST_BUDGET_S == 90 < orchestrator.SPECIALISTS["qualify_leads"][1]
+          and contact_finder.MAX_PAGES == 3 and contact_finder.MX_TIMEOUT_S == 5,
+          "contacts/analyst: own budgets (50 s / 90 s) stay below the orchestrator timeouts; 3 pages per site, 5 s MX")
     check(lead_finder.WEB_SEARCH_TIMEOUT_S * 2 + 60 < orchestrator.SPECIALISTS["find_leads"][1],
           "finder: discovery + website lookup + verification fit inside the find_leads timeout")
 
@@ -553,6 +561,69 @@ async def contact_unit_tests():
         check(False, "contacts: missing leads raises ValueError")
     except ValueError:
         check(True, "contacts: missing leads raises ValueError")
+
+
+async def contact_budget_tests():
+    capture = LogCapture()
+    capture.setLevel(logging.INFO)
+    contact_finder.log.addHandler(capture)
+    saved_budget, contact_finder.CONTACT_BUDGET_S = contact_finder.CONTACT_BUDGET_S, 0.3
+    leads = [_lead("brewlab", "https://brewlab.test"), _lead("hang1", "https://hang1.test"),
+             _lead("hang2", "https://hang2.test")]
+    start = asyncio.get_running_loop().time()
+    try:
+        out = await contact_finder.find_contacts({"leads": leads})
+    finally:
+        contact_finder.CONTACT_BUDGET_S = saved_budget
+        contact_finder.log.removeHandler(capture)
+    took = asyncio.get_running_loop().time() - start
+    reasons = {s["lead_id"]: s["reason"] for s in out["skipped"]}
+    check(took < 1 and reasons == {"hang1": "timed_out", "hang2": "timed_out"}
+          and {c["lead_id"] for c in out["contacts"]} == {"brewlab"}
+          and orchestrator.SKIP_REASONS.get("timed_out") == "lookup timed out",
+          f"contacts: over budget -> partial result, unfinished leads skipped as timed_out ({took:.2f}s, {reasons})")
+    check(any("find_contacts done in" in line and f"{len(out['contacts'])} contacts, 2 skipped (2 timed out)" in line
+              for line in capture.lines), f"contacts: one completion log line with counts ({capture.lines})")
+
+    def slow_mx(domain):
+        import time
+
+        time.sleep(0.5)
+        return True
+
+    saved_mx = contact_finder.MX_TIMEOUT_S
+    contact_finder.mx_ok, contact_finder.MX_TIMEOUT_S = slow_mx, 0.05
+    try:
+        out = await contact_finder.find_contacts({"leads": [_lead("brewlab", "https://brewlab.test")]})
+    finally:
+        contact_finder.mx_ok, contact_finder.MX_TIMEOUT_S = fake_mx_ok, saved_mx
+    by_email = {c["email"]: c for c in out["contacts"]}
+    check(not out["skipped"] and by_email.get("owner@brewlab.test", {}).get("mx_ok", False) is None
+          and by_email["owner@brewlab.test"]["confidence"] == "medium"
+          and by_email.get("hello@brewlab.test", {}).get("confidence") == "low",
+          "contacts: MX lookup timeout -> email kept, mx_ok null (unverified), confidence one level lower")
+
+
+async def analyst_budget_tests():
+    capture = LogCapture()
+    capture.setLevel(logging.INFO)
+    lead_analyst.log.addHandler(capture)
+    saved_budget, lead_analyst.ANALYST_BUDGET_S = lead_analyst.ANALYST_BUDGET_S, 0.3
+    start = asyncio.get_running_loop().time()
+    try:
+        out = await lead_analyst.qualify_leads({"icp": ICP, "leads": [_lead("brewlab", "https://brewlab.test"),
+                                                                      _lead("hang1", "https://hang1.test")]})
+    finally:
+        lead_analyst.ANALYST_BUDGET_S = saved_budget
+        lead_analyst.log.removeHandler(capture)
+    took = asyncio.get_running_loop().time() - start
+    by_id = {r["lead_id"]: r for r in out["reviews"]}
+    check(took < 1 and by_id.get("hang1") == lead_analyst.timed_out_review(_lead("hang1"))
+          and by_id["hang1"]["fit_score"] == 0 and by_id["hang1"]["hooks"] == []
+          and by_id.get("brewlab", {}).get("fallback") is False,
+          f"analyst: over budget -> partial result, unfinished leads get a 'review timed out' review ({took:.2f}s)")
+    check(any("qualify_leads done in" in line and "2 reviews, 1 by the LLM, 1 timed out" in line for line in capture.lines),
+          f"analyst: one completion log line with counts ({capture.lines})")
 
 
 async def _qualify_with(fake, leads: list[dict]) -> dict:
@@ -1216,8 +1287,8 @@ async def payment_tests():
 
     ctx = FakePayCtx()
     await payments.offer(ctx, buyer, dict(st.DEFAULT_CAMPAIGN, log=[]))
-    check(not ctx.of(RequestPayment) and "free" in text_of(ctx.sent[0][1]),
-          "payments: no contacts yet -> no payment request, free flow explained")
+    check(not ctx.of(RequestPayment) and "offered once leads and contacts are ready" in text_of(ctx.sent[0][1]),
+          "payments: no contacts yet -> no payment request, 'offered once ... contacts' reply")
 
     ctx = FakePayCtx()
     ctx.data[st.storage_key(buyer)] = pack_camp
@@ -1277,11 +1348,78 @@ async def payment_tests():
         check(False, f"payments: handler raised {err!r}")
 
 
+class FakeToolCtx(FakePayCtx):
+    """FakePayCtx + send_and_receive that replays scripted (reply, status) pairs and records each request."""
+
+    def __init__(self, replies: list):
+        super().__init__()
+        self.replies, self.requests = list(replies), []
+
+    async def send_and_receive(self, to, msg, response_type=None, timeout=None):
+        self.requests.append((to, msg, timeout))
+        return self.replies.pop(0)
+
+
+async def orchestrator_live_fix_tests():
+    from uagents_core.contrib.protocols.payment import RequestPayment
+
+    from common import ToolResponse
+
+    buyer, mention = "agent1qbuyer", f"@{orchestrator.agent.address}"
+    llm_calls: list[str] = []
+
+    async def recording_parse(text, state, gate, numbered):
+        llm_calls.append(text)
+        return {"intent": "unknown", "args": {}, "confidence": 0.2}
+
+    llm.parse_intent, saved_parse = recording_parse, llm.parse_intent
+    try:
+        no_contacts = st.load(FakePayCtx(), buyer)
+        no_contacts.update(state=st.AWAIT_LEADS, leads=[{"id": "l1", "name": "Brew Lab"}])
+        cmds = [await orchestrator.understand(text, no_contacts)
+                for text in (f"  {mention}  buy lead pack", f"{mention} Can I buy the LEAD PACK?", f"{mention} buy pack",
+                             f"{mention} approve")]
+        check([c["intent"] for c in cmds] == ["buy_lead_pack"] * 3 + ["approve"] and llm_calls == [],
+              f"orchestrator: '@agent1… ' mention stripped; 'lead pack'/'buy pack' -> buy_lead_pack, no LLM call ({cmds})")
+
+        ctx = FakePayCtx()
+        await orchestrator.dispatch(ctx, buyer, no_contacts, cmds[0])
+        check(not ctx.of(RequestPayment) and len(ctx.sent) == 1 and text_of(ctx.sent[0][1]) ==
+              "The lead pack is offered once leads and contacts are ready — finish the contacts step first."
+              and no_contacts["state"] == st.AWAIT_LEADS,
+              "orchestrator: mention-prefixed 'buy lead pack' before contacts -> polite 'offered once' reply")
+        ready = dict(no_contacts, state=st.AWAIT_CONTACTS, campaign_id="c_live", log=[],
+                     contacts=[{"lead_id": "l1", "email": "hello@brewlab.test", "source_url": "https://brewlab.test/"}])
+        ctx = FakePayCtx()
+        await orchestrator.dispatch(ctx, buyer, ready, cmds[0])
+        check(len(ctx.of(RequestPayment)) == 1 and ready["state"] == st.AWAIT_CONTACTS,
+              "orchestrator: mention-prefixed 'buy lead pack' after contacts -> RequestPayment, state untouched")
+
+        ok = ToolResponse(ok=True, result=json.dumps({"contacts": ready["contacts"], "skipped": []}))
+        tctx = FakeToolCtx([(None, "timeout"), (ok, "delivered")])
+        c = dict(no_contacts, log=[], icp=ICP)
+        await orchestrator.dispatch(tctx, buyer, c, {"intent": "approve", "args": {}})
+        check(c["state"] == st.STEP_FAILED and c["failed_gate"] == "contacts"
+              and text_of(tctx.sent[-1][1]) ==
+              "⚠ Contact Finder timed out — reply **retry** to try again, or **skip** to move on."
+              and tctx.requests[0][2] == orchestrator.tool_timeout("find_contacts"),
+              f"orchestrator: specialist timeout -> STEP_FAILED + 'Contact Finder timed out — reply retry' "
+              f"({text_of(tctx.sent[-1][1])})")
+        await orchestrator.dispatch(tctx, buyer, c, await orchestrator.understand(f"{mention} retry", c))
+        first, second = (r[1] for r in tctx.requests)
+        check(len(tctx.requests) == 2 and first.tool == second.tool == "find_contacts"
+              and first.args_json == second.args_json and c["state"] == st.AWAIT_CONTACTS and len(c["contacts"]) == 1,
+              "orchestrator: 'retry' after a timeout re-sends the same find_contacts request and recovers")
+    finally:
+        llm.parse_intent = saved_parse
+
+
 _saved_recipient = os.environ.pop("LEADPACK_RECIPIENT", None)  # the payment checks expect the default recipient
 _saved_default_recipient = orchestrator.payments.DEFAULT_RECIPIENT
 _pay_loop = asyncio.new_event_loop()  # a private loop: the Bureau's loop is left untouched
 try:
     _pay_loop.run_until_complete(payment_tests())
+    _pay_loop.run_until_complete(orchestrator_live_fix_tests())
 finally:
     _pay_loop.close()
     orchestrator.payments.DEFAULT_RECIPIENT = _saved_default_recipient
