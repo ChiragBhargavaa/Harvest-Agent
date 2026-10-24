@@ -923,6 +923,117 @@ def test_handler_returns_before_the_finder_and_records_who():
     assert labels["Writer"] == "Harvest Writer (agent1qd5wnskl…)"
 
 
+def test_richer_contacts_are_context_and_email_only():
+    """Phone, site, Instagram and Facebook come from OSM tags and the page. Drafts stay email-only."""
+    ctx = FakeCtx()
+    html = (
+        "<html><head><title>Brew Lab</title>"
+        '<script type="application/ld+json">{"@type":"CafeOrCoffeeShop","telephone":"+91 141 234 5678"}</script>'
+        "</head><body>"
+        "<a href='mailto:hello@brew.test'>mail</a>"
+        "<a href='tel:+919876543210'>call</a>"
+        "<a href='https://www.instagram.com/brewlab/'>ig</a>"
+        "<a href='https://www.facebook.com/brewlab'>fb</a>"
+        "<a href='https://facebook.com/sharer/sharer.php?u=https://brew.test'>share</a>"
+        "Brew Lab</body></html>"
+    )
+    captured = []
+
+    async def fake_http(method, url, **kwargs):
+        if url.endswith("/robots.txt"):
+            return {"status": 404, "headers": {}, "content": b"", "url": url}
+        if "api.asi1.ai" in url:
+            captured.append(kwargs.get("json_body"))
+            draft = {"subject": "Hello", "hook_used": None,
+                     "body_text": "If you'd prefer not to hear from me again, just reply 'unsubscribe'."}
+            body = json.dumps({"choices": [{"message": {"content": json.dumps(draft)}}]}).encode()
+            return {"status": 200, "headers": {"Content-Type": "application/json"}, "content": body, "url": url}
+        return {"status": 200, "headers": {"Content-Type": "text/html"}, "content": html.encode(), "url": url}
+
+    mod.http_request = fake_http
+    mod.mx_ok = lambda domain: True
+    os.environ["ASI1_API_KEY"] = "test-key-not-real"
+    osm = mod._to_lead({
+        "type": "node", "id": 1, "lat": 26.9, "lon": 75.8,
+        "tags": {
+            "name": "Brew Lab", "amenity": "cafe", "website": "https://brew.test",
+            "phone": "+91 98290 11111", "contact:instagram": "brewlab",
+            "contact:facebook": "https://facebook.com/brewlab", "email": "owner@brew.test",
+        },
+    })
+    assert osm["phone"] == "+91 98290 11111"
+    assert osm["instagram"] == "brewlab"
+    assert osm["facebook"] == "https://facebook.com/brewlab"
+    assert osm["osm_emails"] == ["owner@brew.test"]
+    phone_only = {
+        "id": "osm:node/2", "name": "Phone Cafe", "website": None, "osm_emails": [],
+        "phone": "9829012345", "instagram": "phonecafe",
+    }
+    try:
+        async def run():
+            found = await mod.find_contacts({"leads": [osm, phone_only]}, ctx)
+            reviews = await mod.qualify_leads({
+                "icp": {"product": "beans", "business_types": ["cafe"], "osm_tags": ["amenity=cafe"],
+                        "fit_criteria": []},
+                "leads": [phone_only],
+                "contacts": [],
+            }, ctx)
+            drafts = await mod.draft_emails({
+                "profile": mod.load_profile(), "brief": "beans", "icp": {"product": "beans"},
+                "style_rules": [], "leads": [osm], "contacts": found["contacts"], "reviews": [],
+            }, ctx)
+            return found, reviews, drafts
+
+        found, reviews, drafts = asyncio.run(run())
+    finally:
+        os.environ.pop("ASI1_API_KEY", None)
+
+    brew = next(row for row in found["contacts"] if row["email"] == "hello@brew.test")
+    assert "+919829011111" in brew["phones"]
+    assert "+919876543210" in brew["phones"]
+    assert "+911412345678" in brew["phones"]
+    assert brew["instagram"] == "https://instagram.com/brewlab"
+    assert brew["facebook"] == "https://facebook.com/brewlab"
+    assert brew["website"] == "https://brew.test"
+    assert "sharer" not in brew["facebook"]
+    skipped = next(row for row in found["skipped"] if row["lead_id"] == "osm:node/2")
+    assert skipped["note"] == "no email: phone/IG available"
+    assert skipped["instagram"] == "phonecafe"
+    assert "9829012345" in skipped["phones"]
+    signals = reviews["reviews"][0]["signals"]
+    assert signals["instagram"] == "phonecafe"
+    assert "9829012345" in signals["phones"]
+    assert drafts["drafts"][0]["to"] == "hello@brew.test"
+    assert drafts["drafts"][0]["to"] not in {item for item in brew["phones"]}
+    sent = json.dumps(captured)
+    assert "https://instagram.com/brewlab" in sent
+    assert "hello@brew.test" in sent
+    camp = mod.fresh_campaign()
+    camp["leads"] = [osm, phone_only]
+    mod.store_result("contacts", camp, found)
+    summary = mod.dry_run_summary(dict(camp, drafts=[{
+        "lead_id": osm["id"], "to": "hello@brew.test", "subject": "Hello", "approved": True,
+    }]))
+    assert "Phone Cafe — no email: phone/IG available" in summary
+    card = _card_payload(mod.checkpoint("contacts", camp))
+    assert any(row["value"] == "no email: phone/IG available" for row in card["summary_rows"])
+
+    spec = importlib.util.spec_from_file_location("hosted_contacts_channels", ROOT / "hosted" / "contacts" / "agent.py")
+    contacts = importlib.util.module_from_spec(spec)
+    contacts.agent = StubAgent()
+    spec.loader.exec_module(contacts)
+    page = contacts.Page("https://brew.test", 200, html, 1, text="Brew Lab", links=[
+        "mailto:hello@brew.test", "tel:+919876543210",
+        "https://www.instagram.com/brewlab/", "https://www.facebook.com/brewlab",
+        "https://facebook.com/sharer/sharer.php?u=https://brew.test",
+    ])
+    channels = contacts._business_channels(osm, [page])
+    assert channels["instagram"] == "https://instagram.com/brewlab"
+    assert channels["facebook"] == "https://facebook.com/brewlab"
+    assert "+911412345678" in channels["phones"]
+    assert "+919876543210" in channels["phones"]
+
+
 if __name__ == "__main__":
     test_file_compiles_and_protocols_match()
     test_logger_calls_take_one_message()
@@ -941,4 +1052,5 @@ if __name__ == "__main__":
     test_lead_pack_card_survives_bounced_request_and_simulates()
     test_remote_error_falls_back_and_records_inline_actor()
     test_handler_returns_before_the_finder_and_records_who()
+    test_richer_contacts_are_context_and_email_only()
     print("hosted tests ok")

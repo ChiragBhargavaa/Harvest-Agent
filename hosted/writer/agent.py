@@ -11,13 +11,8 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass, field
-from datetime import date
-from urllib.parse import urljoin, urlparse, urlsplit
-from urllib.robotparser import RobotFileParser
 
 import aiohttp
-from bs4 import BeautifulSoup
 from uagents import Context, Model, Protocol
 
 try:
@@ -34,6 +29,7 @@ except ImportError:  # pragma: no cover
 
 # ======================= hosted runtime glue (replaces common.py) =======================
 # Agentverse hosted: the global `agent` is pre-provided. No Agent(...), no agent.run(), no .env, no local files.
+agent = agent  # noqa: F821
 
 class ToolRequest(Model):
     tool: str              # "find_leads" | "find_contacts" | "qualify_leads" | "draft_emails" | "send_emails"
@@ -587,16 +583,30 @@ async def draft_one(profile: dict, lead: dict, contact: dict | None, review: dic
     if not contact or not contact.get("email"):
         return None, {"lead_id": lead["id"], "reason": "no_contact"}
     said = "; ".join(x for x in (product, brief) if x)
+    context = dict(lead)
+    phones = list((contact or {}).get("phones") or [])
+    if phones:
+        context["phones"] = phones
+    elif lead.get("phone") and not context.get("phones"):
+        context["phones"] = [lead.get("phone")]
+    for key in ("website", "instagram", "facebook"):
+        value = (contact or {}).get(key) or (None if context.get(key) else lead.get(key))
+        if (contact or {}).get(key):
+            context[key] = contact[key]
+        elif value and not context.get(key):
+            context[key] = value
+    if contact.get("email"):
+        context["email"] = contact["email"]
     async with sem:
         try:
-            raw = await _llm_draft(profile, lead, review, style_rules, product, brief)
+            raw = await _llm_draft(profile, context, review, style_rules, product, brief)
         except Exception as err:  # noqa: BLE001 - error, timeout, bad JSON -> report this lead, keep going
             log.warning(f"no draft for {lead['id']}: {_why(err)}")
             return None, {"lead_id": lead["id"], "reason": "llm_failed", "detail": _why(err)}
         problems = validate(raw, profile, review, said)
         if any(PROFILE_GAP not in p for p in problems):  # regenerate once with the problems passed back
             try:
-                retry = await _llm_draft(profile, lead, review, style_rules, product, brief, problems=problems)
+                retry = await _llm_draft(profile, context, review, style_rules, product, brief, problems=problems)
                 raw, problems = retry, validate(retry, profile, review, said)
             except Exception as err:  # noqa: BLE001 - keep the first draft and its warnings
                 log.warning(f"regenerating the draft for {lead['id']} failed, keeping the first one: {_why(err)}")
