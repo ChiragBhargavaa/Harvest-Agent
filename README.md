@@ -17,16 +17,16 @@
 
 ## Agents
 
-Addresses are derived from the seeds in `.env` (`bash setup.sh` prints them). Fill in after the first deploy.
+Addresses are fixed by the seeds in `.env` (keep that file; `bash setup.sh` prints them). Profile URLs are added after the mailbox is connected.
 
 | Agent | Name | Role | Address | Agentverse profile |
 |---|---|---|---|---|
-| Orchestrator | `leadreach` | Talks to the brand in ASI:One (Chat Protocol + Interactive Cards), runs the approval gates | `agent1q...` | `<url>` |
-| Lead Finder | `leadreach-finder` | Finds local businesses: OpenStreetMap + ASI:One web search, verifies websites | `agent1q...` | `<url>` |
-| Contact Finder | `leadreach-contacts` | Published emails/phones by polite crawling + MX check | `agent1q...` | `<url>` |
-| Lead Analyst | `leadreach-analyst` | Fit score + evidence-backed hooks from each website | `agent1q...` | `<url>` |
-| Copywriter | `leadreach-writer` | Short personal drafts (ASI:One) + deterministic validator | `agent1q...` | `<url>` |
-| Sender (stretch) | `leadreach-sender` | Dry-run by default, daily cap, send window, unsubscribe | `agent1q...` | `<url>` |
+| Orchestrator | `leadreach` | Talks to the brand in ASI:One (Chat Protocol + Interactive Cards), runs the approval gates | `agent1q0nlrk0hsqgn9l85z8thxmr5tltjqxeqsmjw4zzme389dcw7zkudjq3lk23` | `<url>` |
+| Lead Finder | `leadreach-finder` | Finds local businesses: OpenStreetMap + ASI:One web search, verifies websites | `agent1q06nvrv65ewr9g62te9xrhqgc7hu8kc3823rrvtttu33nsk4krek2w4cz0d` | `<url>` |
+| Contact Finder | `leadreach-contacts` | Published emails/phones by polite crawling + MX check | `agent1qdr009c63xpzznwt07k62vxg5fzpr3kf89s65ckz0rjda2ls3s4evf2v4c8` | `<url>` |
+| Lead Analyst | `leadreach-analyst` | Fit score + evidence-backed hooks from each website | `agent1qd8k32878hmz7jc4cw0cr6mv9q6eqa24xrac6cqxeg0c0kdjf4guj05wpl9` | `<url>` |
+| Copywriter | `leadreach-writer` | Short personal drafts (ASI:One) + deterministic validator | `agent1q2ttlc7yh8dwy4vj8knr6jhmguy9pcp0a8zawtwnf3up26zgdq6qsaech9t` | `<url>` |
+| Sender (stretch) | `leadreach-sender` | Dry-run by default, daily cap, send window, unsubscribe | `agent1q007hz3k52l3pjuwxxfrn28a6xv768alq5jygldx3x7ae6had0d47gtw337` | `<url>` |
 
 ## Problem → Users → Outcome
 
