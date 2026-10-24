@@ -9,10 +9,12 @@ are untouched. On-chain verification is not implemented, so every verification i
 The pack only contains data the campaign already verified (crawled/OSM emails with their source URLs).
 
 Env: LEADPACK_PRICE (default "0.1"), LEADPACK_CURRENCY ("FET"), LEADPACK_PAYMENT_METHOD ("fet_direct"),
-     LEADPACK_RECIPIENT (wallet address; default the agent's Fetch wallet address (fetch1…)).
+     LEADPACK_RECIPIENT (a fetch1… wallet address; invalid -> warning + default). Default: DEFAULT_RECIPIENT,
+     the orchestrator's Fetch wallet address, set at its startup (ctx.agent has no wallet in uAgents 0.26.1).
 """
 
 import os
+import re
 from decimal import Decimal, InvalidOperation
 from uuid import uuid4
 
@@ -31,6 +33,8 @@ import state as st
 from common import chat_text, env_bool, redact
 
 DEADLINE_S = 600
+DEFAULT_RECIPIENT = ""  # the orchestrator's wallet address (fetch1…), set by orchestrator.py at startup
+RECIPIENT_RE = re.compile(r"fetch1[a-z0-9]{33,74}")  # 39-80 chars
 FAST_INTENTS = {"buy lead pack": "buy_lead_pack", "unlock full list": "buy_lead_pack"}
 
 pay_proto = Protocol(spec=payment_protocol_spec, role="seller")
@@ -43,7 +47,17 @@ def price() -> tuple[str, str, str]:
 
 
 def recipient(ctx: Context) -> str:
-    return os.getenv("LEADPACK_RECIPIENT", "").strip() or str(ctx.agent.wallet.address())
+    """LEADPACK_RECIPIENT if it looks like a fetch1… address, else DEFAULT_RECIPIENT, else the agent address."""
+    override = os.getenv("LEADPACK_RECIPIENT", "").strip()
+    if override and RECIPIENT_RE.fullmatch(override):
+        return override
+    if override:  # never log the value itself
+        ctx.logger.warning(f"LEADPACK_RECIPIENT ignored: not a fetch1… wallet address "
+                           f"(starts {override[:6]!r}…, {len(override)} chars); using the default recipient")
+    if DEFAULT_RECIPIENT:
+        return DEFAULT_RECIPIENT
+    ctx.logger.warning("payment recipient: no wallet address set at startup; using the agent address")
+    return str(ctx.agent.address)
 
 
 def verification_mode() -> str:

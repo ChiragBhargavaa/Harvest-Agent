@@ -1,13 +1,15 @@
 """Copywriter agent: `draft_emails` - one short personal email per lead (ASI:One + deterministic validator).
 
-Pipeline per lead (<=8 leads at a time): pick the lead's primary contact (contacts arrive sorted per lead) ->
+Pipeline per lead (<=DRAFT_CONCURRENCY = 15 leads at a time): pick the lead's primary contact (contacts arrive sorted per lead) ->
 llm.draft_email(profile, lead, review, style_rules) -> validate(). Validator (HACKATHON_README §3.12): word count
 <= max_words; subject <= 8 words and <= 60 chars; the exact unsubscribe line; sender name + brand present; no
 {placeholders} or ❓; no price/cost/discount words unless pricing.mention_price; no existing customers, "trusted by"
 or testimonials unless social_proof.can_name_customers with names or a count ("your customers" is fine);
 hook_used matches one of the lead's review hooks. Also: no product claim (e.g. "single-origin", "cordless") that
 the brief, the ICP product, the filled-in profile facts and the lead's review don't contain. On failure regenerate
-once with the problems passed back; if it still fails, keep the draft with `warnings`. Leads without a contact, or
+once with the problems passed back; if it still fails, keep the draft with `warnings`. Problems that only an
+unfilled brand profile causes (sender name, brand name, unsubscribe line) never trigger a regenerate: the LLM can't
+fix them, so they stay as `warnings`. Leads without a contact, or
 whose LLM call fails, go to `skipped` (no draft is ever written without the LLM). Low-confidence contacts are
 drafted too: their approval is enforced at send time (§3.4).
 
@@ -31,6 +33,7 @@ LLM_TIMEOUT_S = env_seconds("LEADREACH_DRAFT_LLM_TIMEOUT", 100)
 DEFAULT_MAX_WORDS = 150  # same default as llm.draft_email
 MAX_SUBJECT_WORDS, MAX_SUBJECT_CHARS = 8, 60
 MIN_HOOK_MATCH_CHARS = 10
+PROFILE_GAP = "config/brand_profile.yaml"  # in every problem caused by an unfilled profile field
 # Product qualities the LLM likes to add; each must appear in the brief / ICP product / known profile facts / review.
 CLAIM_TERMS = (
     "single origin", "fresh roasted", "freshly roasted", "small batch", "organic", "artisan", "artisanal",
@@ -172,7 +175,7 @@ async def draft_one(profile: dict, lead: dict, contact: dict | None, review: dic
             log.warning(f"no draft for {lead['id']}: {_why(err)}")
             return None, {"lead_id": lead["id"], "reason": "llm_failed", "detail": _why(err)}
         problems = validate(raw, profile, review, said)
-        if problems:  # regenerate once with the problems passed back
+        if any(PROFILE_GAP not in p for p in problems):  # regenerate once with the problems passed back
             try:
                 retry = await _llm_draft(profile, lead, review, style_rules, product, brief, problems=problems)
                 raw, problems = retry, validate(retry, profile, review, said)

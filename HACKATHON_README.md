@@ -405,6 +405,8 @@ brief) and those facts. Unless the profile allows them (same rules as the valida
 discounts, and no existing customers or testimonials.
 On failure regenerate once via `llm.draft_email(..., problems=[...])` (the problems are passed back to the LLM), then
 return the draft with the remaining problems as `warnings` (a failing regenerate keeps the first draft and its warnings).
+If the only problems come from unfilled profile fields (sender name, brand name, unsubscribe line: "not filled in"),
+there is no regenerate (the LLM can't fix them): one LLM call, those problems become `warnings`.
 
 ### 3.13 Data sources and crawling rules
 **Lead sources (no Google key needed)**
@@ -518,7 +520,7 @@ Shared modules are fine for mailbox agents run from this repo. If an agent moves
 helpers into one file (§4.7).
 
 ### 3.18 Milestones and acceptance tests
-**Mock test** ✅ (`agents/mock_test.py`, 110 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
+**Mock test** ✅ (`agents/mock_test.py`, 139 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
 fetcher and `mx_ok` are monkeypatched; all agents + a scripted user run in a `Bureau(port=8010)`; exit code 0 = pass.
 
 | Milestone | Done when |
@@ -680,7 +682,9 @@ So try `json.loads` first, then fall back to the LLM intent parser. If validatio
 - **LeadReach status ✅ (mock test):** `agents/payments.py` builds `Protocol(spec=payment_protocol_spec, role="seller")`, and
   the orchestrator includes it with `publish_manifest=True`. In chat, **buy lead pack** / **unlock full list** sends a `RequestPayment` for a
   "verified lead pack" (`LEADPACK_PRICE` default `0.1`, `LEADPACK_CURRENCY` default `FET`, `LEADPACK_PAYMENT_METHOD` default
-  `fet_direct`, recipient `LEADPACK_RECIPIENT` or the orchestrator's Fetch wallet address (fetch1…), 10-minute deadline). Nothing is offered until the campaign has contacts.
+  `fet_direct`, recipient `LEADPACK_RECIPIENT` if it looks like a `fetch1…` address (else a warning that doesn't log the value), otherwise
+`payments.DEFAULT_RECIPIENT` = the orchestrator's Fetch wallet address, set in its startup handler because `ctx.agent` has no
+`wallet` in uAgents 0.26.1, 10-minute deadline). Nothing is offered until the campaign has contacts.
   `CommitPayment` is checked against the open request (transaction id, reference, currency, amount ≥ price, recipient). That
   check is a **DEMO verification**, labelled as such in the logs and the reply; there is no on-chain or Stripe check yet. Valid →
   `CompletePayment` plus the pack (each verified contact with its source URL). Invalid, or no open request → `CancelPayment`.
@@ -765,7 +769,7 @@ agent.include(pay_proto, publish_manifest=True)
 ---
 
 ## 5. Repo state (24 Oct 2026)
-- **Feature freeze for the submission:** M0–M4 done; M5 and M6 out of scope. `agents/mock_test.py` passes (**110 checks**) ✅;
+- **Feature freeze for the submission:** M0–M4 done; M5 and M6 out of scope. `agents/mock_test.py` passes (**139 checks**) ✅;
   `ruff check agents scripts` is clean.
 - **Implemented (5 of 6 agents):**
   - orchestrator: intent, ICP, gates, cards, pause/resume, settings, retry/skip, audit log, `edit_draft` (per-draft edits;

@@ -336,6 +336,24 @@ async def finder_unit_tests():
           and "Brew Lab Roasters" in [x["name"] for x in out["leads"]],
           f"finder: a timed-out query becomes a note, not a failure ({took:.2f}s)")
 
+    key = os.environ["ASI1_API_KEY"]
+
+    async def leaky(icp, query):
+        raise RuntimeError(f"401 bad key {key} (Bearer abcdef123456)")
+
+    async def osm_down(*_a, **_k):
+        raise RuntimeError(f"Overpass 500, key {key}")
+
+    geo.find_businesses, original_osm = osm_down, geo.find_businesses
+    try:
+        out, _ = await _find_with(leaky, ["q1"])
+    finally:
+        geo.find_businesses = original_osm
+    notes = " ".join(out["source_notes"])
+    check(key not in notes and "abcdef123456" not in notes and "Web search failed for 'q1': 401 bad key ***" in notes
+          and "OpenStreetMap failed (Overpass 500, key ***)" in notes,
+          f"finder: web-search and OSM error text is redacted in source_notes ({out['source_notes']})")
+
     async def hanging_websites(businesses, city):
         await asyncio.sleep(5)
         return {}
@@ -707,6 +725,18 @@ async def copywriter_unit_tests():
     check(len(calls) == 2 and d["warnings"] and "Bean Co" not in d["body_text"],
           "copywriter: regenerate error -> first draft kept with its warnings")
 
+    unfilled_profile = dict(PROFILE, brand={"name": "❓", "sender_name": "❓"})  # like the real ❓ profile
+    fake, calls = _scripted(GOOD, GOOD)
+    d = (await _draft_with(fake, dict(args, profile=unfilled_profile)))["drafts"][0]
+    check(len(calls) == 1 and len(d["warnings"]) == 2 and all("not filled in" in w for w in d["warnings"])
+          and d["body_text"] == GOOD["body_text"],
+          f"copywriter: only unfilled-profile problems -> one LLM call, kept as warnings ({d['warnings']})")
+    fake, calls = _scripted(bad["price"], GOOD)
+    d = (await _draft_with(fake, dict(args, profile=unfilled_profile)))["drafts"][0]
+    check(len(calls) == 2 and "do not mention prices" in (calls[1]["problems"] or [])
+          and len(d["warnings"]) == 2 and all("not filled in" in w for w in d["warnings"]),
+          f"copywriter: unfilled profile + another problem -> still regenerates once ({d['warnings']})")
+
     async def per_lead(profile, lead, qualification, style_rules, problems=None, **_kw):
         if lead["id"] == "broken":
             raise ValueError("LLM did not return JSON")
@@ -948,6 +978,33 @@ def supervisor_tests():
           f"supervisor restarts an exiting child up to max_restarts ({out})")
     check(len(slow) == 1 and slow[0].poll() is not None, "supervisor terminates running children on stop")
 
+    printed: list[str] = []
+    run_all.print = lambda *a, **_k: printed.append(" ".join(map(str, a)))  # shadows the builtin in run_all
+    try:
+        for window, cap in ((300.0, 2), (0.01, 1)):
+            stop, out = threading.Event(), {}
+            cmds = {"orchestrator": [sys.executable, "-c", "import os; print('unbuffered', os.environ.get('PYTHONUNBUFFERED'))"]}
+            kw = {"base_delay": 0.05, "max_delay": 0.05, "max_restarts": cap, "poll": 0.05, "window": window}
+            t = threading.Thread(target=lambda out=out, cmds=cmds, stop=stop, kw=kw: out.update(
+                run_all.supervise(cmds, stop, **kw)))
+            t.start()
+            time.sleep(1.0)
+            stop.set()
+            t.join(15)
+            if window == 300.0:
+                gave_up = [line for line in printed if "giving up" in line]
+                check(out == {"orchestrator": 2} and gave_up == [run_all.give_up_message("orchestrator")]
+                      and "port 8001 in use?" in gave_up[0] and "lsof -iTCP:8001 -sTCP:LISTEN" in gave_up[0],
+                      f"supervisor: {cap} restarts within the window -> gives up once with a port hint ({out}, {gave_up})")
+                check(any("unbuffered 1" in line for line in printed), "supervisor: children run with PYTHONUNBUFFERED=1")
+            else:
+                check(out.get("orchestrator", 0) > cap, f"supervisor: restarts outside the window don't count ({out})")
+            printed.clear()
+    finally:
+        del run_all.print
+    check(run_all.PORTS == dict(zip(run_all.AGENTS, range(8001, 8007), strict=True)) and run_all.MAX_RESTARTS == 5
+          and run_all.RESTART_WINDOW_S == 300, "supervisor: main() caps restarts at 5 per 300 s; ports 8001..8006")
+
 
 @user.on_event("startup")
 async def run_script(ctx: Context):
@@ -1093,7 +1150,9 @@ class FakePayCtx:
                                       "set": lambda s, k, v: self.data.__setitem__(k, v),
                                       "remove": lambda s, k: self.data.pop(k, None)})()
         self.logger = logging.getLogger("mock-payments")
-        self.agent = type("A", (), {"address": orchestrator.agent.address, "wallet": orchestrator.agent.wallet})()
+        # like uAgents' AgentRepresentation: address, name, identifier - and no wallet
+        self.agent = type("A", (), {"address": orchestrator.agent.address, "name": orchestrator.agent.name,
+                                    "identifier": orchestrator.agent.identifier})()
 
     async def send(self, to, msg):
         if self.fail_send:
@@ -1117,15 +1176,34 @@ async def payment_tests():
     import payments
 
     buyer = "agent1qbuyer"
-    wallet = str(orchestrator.agent.wallet.address())
     rctx = FakePayCtx()
+    try:
+        _ = rctx.agent.wallet
+        check(False, "payments: the fake ctx.agent has no wallet (like AgentRepresentation)")
+    except AttributeError:
+        check(True, "payments: the fake ctx.agent has no wallet (like AgentRepresentation)")
+    capture = LogCapture()
+    rctx.logger.addHandler(capture)
+    payments.DEFAULT_RECIPIENT = ""
+    check(payments.recipient(rctx) == orchestrator.agent.address and capture.lines,
+          "payments: no startup wallet address -> agent address, with a warning (never ctx.agent.wallet)")
+    payments.DEFAULT_RECIPIENT = str(orchestrator.agent.wallet.address())  # what the orchestrator startup does
+    wallet = payments.DEFAULT_RECIPIENT
     check(wallet.startswith("fetch1") and payments.recipient(rctx) == wallet,
           "payments: LEADPACK_RECIPIENT unset -> recipient is the orchestrator's Fetch wallet address (fetch1…)")
-    os.environ["LEADPACK_RECIPIENT"] = "  fetch1override  "
+    override = "fetch1" + "q" * 38
+    os.environ["LEADPACK_RECIPIENT"] = f"  {override}  "
     try:
-        check(payments.recipient(rctx) == "fetch1override", "payments: LEADPACK_RECIPIENT set -> it wins (stripped)")
+        check(payments.recipient(rctx) == override, "payments: valid LEADPACK_RECIPIENT -> it wins (stripped)")
+        for bad_value in ("agent1qxyz", "fetch1short"):
+            os.environ["LEADPACK_RECIPIENT"] = bad_value
+            capture.lines.clear()
+            check(payments.recipient(rctx) == wallet and len(capture.lines) == 1
+                  and bad_value not in capture.lines[0],
+                  f"payments: invalid LEADPACK_RECIPIENT {bad_value!r} -> wallet address + a warning (value not logged)")
     finally:
         os.environ.pop("LEADPACK_RECIPIENT", None)
+        rctx.logger.removeHandler(capture)
 
     check(orchestrator.FAST_INTENTS.get("buy lead pack") == "buy_lead_pack"
           and payments.pay_proto.digest in orchestrator.agent.protocols,
@@ -1200,11 +1278,13 @@ async def payment_tests():
 
 
 _saved_recipient = os.environ.pop("LEADPACK_RECIPIENT", None)  # the payment checks expect the default recipient
+_saved_default_recipient = orchestrator.payments.DEFAULT_RECIPIENT
 _pay_loop = asyncio.new_event_loop()  # a private loop: the Bureau's loop is left untouched
 try:
     _pay_loop.run_until_complete(payment_tests())
 finally:
     _pay_loop.close()
+    orchestrator.payments.DEFAULT_RECIPIENT = _saved_default_recipient
     if _saved_recipient is not None:
         os.environ["LEADPACK_RECIPIENT"] = _saved_recipient
 

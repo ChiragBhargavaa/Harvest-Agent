@@ -29,7 +29,7 @@ rejected it.
 - 6 uAgents in `agents/`, each runnable alone (`python agents/<file>.py`). Ports 8001–8006.
 - `uagents==0.26.1`, `uagents-core==0.4.12`, Python 3.13 in `.venv`. Deps are pinned in `pyproject.toml`, locked in `uv.lock`, and
   exported to `requirements.txt`.
-- `.venv/bin/python agents/mock_test.py` → **exit 0, 110/110 checks pass** (offline: mocked LLM, OSM and fetch).
+- `.venv/bin/python agents/mock_test.py` → **exit 0, 139/139 checks pass** (offline: mocked LLM, OSM and fetch).
 - `ruff check agents scripts` is clean. All 6 agents boot locally with `MAILBOX=false`; `scripts/run_all.py` starts all 6.
 - **Feature freeze:** M0–M4 done. M5 (`add_lead` / `import_list` / `classify_reply`) and M6 (sender) are out of scope for the
   submission; they are answered "not part of this demo yet" / the sender shell replies "not implemented yet".

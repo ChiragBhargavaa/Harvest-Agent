@@ -639,6 +639,7 @@ agent.include(payments.pay_proto, publish_manifest=True)  # Payment Protocol, se
 @agent.on_event("startup")
 async def show_address(ctx: Context):
     ctx.logger.info(f"Orchestrator address: {agent.address}")
+    payments.DEFAULT_RECIPIENT = str(agent.wallet.address())
     missing = [env for env, _ in SPECIALISTS.values() if not os.getenv(env)]
     if missing:
         ctx.logger.warning(f"Specialist addresses not set yet: {missing} (run setup.sh)")

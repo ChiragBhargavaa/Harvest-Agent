@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 
 import geo
 import llm
-from common import make_specialist
+from common import make_specialist, redact
 from crawl import PoliteFetcher, is_banned, name_matches, normalise_url
 
 MAX_LIMIT = 15
@@ -73,7 +73,7 @@ def _rank(lead: dict) -> int:
 
 
 def _why(err: BaseException) -> str:
-    return f"timed out after {WEB_SEARCH_TIMEOUT_S:g}s" if isinstance(err, asyncio.TimeoutError) else str(err)
+    return f"timed out after {WEB_SEARCH_TIMEOUT_S:g}s" if isinstance(err, asyncio.TimeoutError) else redact(err)
 
 
 async def _discover_all(icp: dict, queries: list[str]) -> list:
@@ -127,7 +127,7 @@ async def find_leads(args: dict) -> dict:
                      f"{sum(1 for x in osm if x['website'])} list a website.")
     except Exception as err:  # noqa: BLE001 - partial success: continue with web search
         osm = []
-        notes.append(f"OpenStreetMap failed ({err}); using web search only.")
+        notes.append(f"OpenStreetMap failed ({redact(err)}); using web search only.")
     banned_osm = 0
     for lead in osm:
         url = normalise_url(lead.get("website"))
