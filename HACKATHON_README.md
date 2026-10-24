@@ -259,10 +259,17 @@ Send **≤15 leads per request**.
 A lead appears in `skipped` only if it ends up with no contact. Contacts are deduped per lead (best confidence wins) and
 sorted per lead: confidence, then primary-contact role. `phones` = all phones seen on the site plus the OSM phone tag.
 Leads are crawled concurrently (≤5 at a time, one shared `PoliteFetcher`); MX lookups run in a thread, once per domain.
-**`qualify_leads`** (M3)
+**`qualify_leads`** ✅ implemented (M3)
 ```jsonc
 {"icp": ICP, "leads": [Lead], "contacts": [Contact]}  →  {"reviews": [Review]}
 ```
+Every lead gets exactly one review, sorted best fit first. Leads are reviewed concurrently (≤5 at a time, one shared
+`PoliteFetcher`): `crawl_site` → `site_signals` (homepage, with keyword flags / years / app links merged across the crawled pages,
+plus `pages_crawled`) → `llm.qualify` (60 s timeout). A hook is kept only if its `evidence` (every `...`-separated fragment,
+≥10 chars) appears in a crawled page's text, or the homepage title / meta description; its `evidence_url` is set to that page.
+LLM failure (error, timeout, bad JSON, missing/invalid `fit_score` or `hooks`) → deterministic signals-only review,
+`fallback: true`, no hooks. No website or failed crawl → `reachable: false` + `unreachable_reason`
+(`no_website|banned_host|robots_disallowed|unreachable`), signals-only, no LLM call. `contacts` is accepted but not used yet.
 **`draft_emails`** (M4)
 ```jsonc
 {"profile": BrandProfile, "style_rules": [], "icp": ICP, "leads": [Lead], "contacts": [Contact], "reviews": [Review]}  →  {"drafts": [Draft]}
@@ -289,7 +296,9 @@ Leads are crawled concurrently (≤5 at a time, one shared `PoliteFetcher`); MX 
  "source": "website|osm", "source_url": "https://.../contact", "confidence": "high|medium|low", "mx_ok": true, "phones": []}
 
 // Review
-{"lead_id": "...", "reachable": true, "signals": {...site_signals...}, "fit_score": 0-100, "hooks": [Hook], "summary": "≤40 words"}
+{"lead_id": "...", "reachable": true, "unreachable_reason": "no_website|banned_host|robots_disallowed|unreachable | null",
+ "signals": {...site_signals..., "pages_crawled": 2} | {}, "fit_score": 0-100, "hooks": [Hook], "summary": "≤40 words",
+ "fallback": false}  // fallback = scored from signals only (LLM failed, or no reachable site)
 
 // Hook (max 3)
 {"observation": "≤25 words", "evidence": "exact snippet", "evidence_url": "https://...", "angle": "≤20 words"}
@@ -433,7 +442,7 @@ agents/
   orchestrator.py    chat protocol, intent, state machine, gates          ✅ M0
   lead_finder.py     find_leads                                           ✅ M1 logic
   contact_finder.py  find_contacts                                        ✅ M2 logic
-  lead_analyst.py    qualify_leads (site_signals done; LLM scoring → M3)
+  lead_analyst.py    qualify_leads                                        ✅ M3 logic
   copywriter.py      draft_emails (shell → M4)
   sender.py          send_emails (shell → M6, stretch)
   mock_test.py       offline end-to-end test (mocked LLM + OSM + fetch)
@@ -447,7 +456,7 @@ Shared modules are fine for mailbox agents run from this repo. If an agent moves
 helpers into one file (§4.7).
 
 ### 3.18 Milestones and acceptance tests
-**Mock test** ✅ (`agents/mock_test.py`, 39 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
+**Mock test** ✅ (`agents/mock_test.py`, 57 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
 fetcher and `mx_ok` are monkeypatched; all agents + a scripted user run in a `Bureau(port=8010)`; exit code 0 = pass.
 
 | Milestone | Done when |
@@ -687,9 +696,10 @@ agent.include(pay_proto, publish_manifest=True)
 ## 5. Repo state (24 Oct 2026)
 - **M0 done:** all files in §3.17 exist; the 6 agents boot; `agents/mock_test.py` passes (20 checks) ✅.
 - **Implemented:** orchestrator (intent, gates, cards, pause/resume, settings, retry/skip, audit log), `find_leads`
-  (OSM + web search + verification), `find_contacts` (polite crawl + extraction + MX, mock-tested only), crawler, geo,
-  all LLM prompts, `site_signals`.
-- **Shells (return `ok=False, "not implemented yet"`):** `qualify_leads` (M3), `draft_emails` (M4), `send_emails` (M6).
+  (OSM + web search + verification), `find_contacts` (polite crawl + extraction + MX, mock-tested only), `qualify_leads`
+  (crawl + signals + LLM hooks filtered against page text, signals-only fallback; mock-tested only), crawler, geo,
+  all LLM prompts.
+- **Shells (return `ok=False, "not implemented yet"`):** `draft_emails` (M4), `send_emails` (M6).
 - **Not yet done by Chirag:** `ASI1_API_KEY` in `.env`, run `setup.sh`, `scripts/probe_sources.py`, mailbox connection, Agentverse profiles.
 - The earlier generic starter (`specialist.py`/`page_check`) was folded into `common.make_specialist` and `lead_analyst.site_signals`.
 

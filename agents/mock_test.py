@@ -108,6 +108,15 @@ SITES = {
     "quiet.test": [_page("https://quiet.test/", "We roast quietly. Visit us.")],
     "deadmx.test": [_page("https://deadmx.test/", "info@deadmx.test")],
     "linkhub.test": [_page("https://www.instagram.com/somecafe", "Follow us")],  # redirects to a banned host
+    "roastery.test": [
+        Page("https://roastery.test/", 200,
+             '<html><head><title>Bean and Bloom Cafe</title><meta name="viewport" content="width=device-width">'
+             '<meta name="description" content="All-day cafe in C-Scheme, Jaipur"></head></html>', 90,
+             text="Bean & Bloom Cafe. We brew espresso and pour-over all day. See our menu. © 2026",
+             links=["https://roastery.test/about"]),
+        _page("https://roastery.test/about", "Opened our second outlet in Malviya Nagar in 2026. "
+                                             "Weekend latte art workshops."),
+    ],
 }
 ROBOTS_BLOCKED = {"private.test"}
 crawl_stats = {"active": 0, "peak": 0}
@@ -151,7 +160,21 @@ def fake_mx_ok(domain):
     return domain != "deadmx.test"
 
 
+qualify_calls: list[dict] = []
+
+
+async def fake_qualify(icp, lead, signals, page_text):
+    """One hook backed by the crawled page, one invented (must be dropped)."""
+    qualify_calls.append({"lead": lead["id"], "signals": signals, "page_text": page_text})
+    return {"fit_score": 81, "summary": "Roastery-cafe that takes direct orders.",
+            "hooks": [{"observation": "Takes orders by email", "evidence": "Orders: orders@brewlab.test",
+                       "evidence_url": "https://brewlab.test/contact", "angle": "Easy to pitch a wholesale trial"},
+                      {"observation": "Opened a second outlet", "evidence": "now open in Vaishali Nagar",
+                       "evidence_url": "https://brewlab.test/", "angle": "More outlets, more beans"}]}
+
+
 llm.parse_intent = fake_parse_intent
+llm.qualify = fake_qualify
 llm.build_icp = fake_build_icp
 llm.discover_businesses = fake_discover
 llm.find_websites = fake_find_websites
@@ -160,6 +183,7 @@ geo.find_businesses = fake_find_businesses
 lead_finder.PoliteFetcher = FakeFetcher
 contact_finder.PoliteFetcher = FakeFetcher
 contact_finder.mx_ok = fake_mx_ok
+lead_analyst.PoliteFetcher = FakeFetcher
 
 # ---------------- scripted user ----------------
 
@@ -219,6 +243,7 @@ async def unit_tests():
     check([x["name"] for x in out["call_list"]] == ["Chai Point Corner"], "phone-only business goes to call list")
 
     await contact_unit_tests()
+    await analyst_unit_tests()
     await llm_request_tests()
 
 
@@ -321,6 +346,95 @@ async def contact_unit_tests():
         check(True, "contacts: missing leads raises ValueError")
 
 
+async def _qualify_with(fake, leads: list[dict]) -> dict:
+    llm.qualify, original = fake, llm.qualify
+    try:
+        out = await lead_analyst.qualify_leads({"icp": ICP, "leads": leads, "contacts": []})
+    finally:
+        llm.qualify = original
+    return {r["lead_id"]: r for r in out["reviews"]}
+
+
+async def analyst_unit_tests():
+    seen: list[dict] = []
+
+    async def mixed_hooks(icp, lead, signals, page_text):
+        seen.append({"signals": signals, "page_text": page_text})
+        return {"fit_score": "88", "summary": "Busy specialty cafe, expanding.", "hooks": [
+            {"observation": "Brews espresso all day", "evidence": "We brew espresso … all day",
+             "evidence_url": "https://roastery.test/menu", "angle": "Beans for a high-volume espresso bar"},
+            {"observation": "Opened a second outlet", "evidence": "Opened our second outlet in Malviya Nagar",
+             "evidence_url": "https://roastery.test/about", "angle": "Supply both outlets"},
+            {"observation": "Voted best cafe in Jaipur", "evidence": "Voted best cafe in Jaipur 2025",
+             "evidence_url": "https://roastery.test/", "angle": "Award winners deserve award beans"},
+            {"observation": "Has a menu", "evidence": "menu", "evidence_url": "https://roastery.test/", "angle": "x"},
+            {"observation": "All-day cafe in C-Scheme", "evidence": "All-day cafe in C-Scheme, Jaipur",
+             "evidence_url": "https://roastery.test/", "angle": "Central location"},
+        ]}
+
+    leads = [_lead("roastery", "https://roastery.test"), _lead("nosite"), _lead("down", "https://down.test"),
+             _lead("private", "https://private.test"), _lead("fb", "https://www.facebook.com/somecafe")]
+    by_id = await _qualify_with(mixed_hooks, leads)
+    r = by_id["roastery"]
+    hooks = {h["evidence"]: h["evidence_url"] for h in r["hooks"]}
+    check(r["reachable"] and r["fallback"] is False and r["fit_score"] == 88
+          and r["summary"] == "Busy specialty cafe, expanding.", "analyst: LLM review used (score, summary)")
+    check(hooks == {"We brew espresso … all day": "https://roastery.test/",
+                    "Opened our second outlet in Malviya Nagar": "https://roastery.test/about",
+                    "All-day cafe in C-Scheme, Jaipur": "https://roastery.test/"},
+          f"analyst: only observed hooks kept, evidence_url = page it was seen on ({hooks})")
+    check(not any("Voted" in h["evidence"] or h["evidence"] == "menu" for h in r["hooks"]),
+          "analyst: invented and trivial hooks dropped")
+    sig = r["signals"]
+    check(sig.get("pages_crawled") == 2 and sig["keywords"]["events"] and sig["keywords"]["menu"]
+          and sig["mobile_viewport"] and sig["latest_year_seen"] == 2026 and sig["title"] == "Bean and Bloom Cafe",
+          "analyst: site_signals merged across crawled pages")
+    check(len(seen) == 1 and "[https://roastery.test/about]" in seen[0]["page_text"] and seen[0]["signals"] == sig,
+          "analyst: llm.qualify gets signals + page text with URLs, only for reachable sites")
+    reasons = {k: (v["reachable"], v["unreachable_reason"], v["hooks"], v["fallback"]) for k, v in by_id.items()
+               if k != "roastery"}
+    check(reasons == {"nosite": (False, "no_website", [], True), "down": (False, "unreachable", [], True),
+                      "private": (False, "robots_disallowed", [], True), "fb": (False, "banned_host", [], True)},
+          f"analyst: no-site / failed crawls get signals-only reviews with a reason ({reasons})")
+    check(all(set(v) >= {"lead_id", "reachable", "signals", "fit_score", "hooks", "summary"} and len(v["summary"].split()) <= 40
+              for v in by_id.values()), "analyst: every review has the §3.8 shape")
+
+    async def broken(*_a, **_k):
+        raise RuntimeError("ASI:One unavailable")
+
+    r = (await _qualify_with(broken, [_lead("roastery", "https://roastery.test")]))["roastery"]
+    check(r["fallback"] is True and r["hooks"] == [] and r["reachable"] and 0 <= r["fit_score"] <= 100
+          and r["summary"].startswith("Signals-only") and "brews espresso" in r["summary"],
+          f"analyst: LLM error -> deterministic signals-only review ({r['fit_score']}: {r['summary']})")
+    again = (await _qualify_with(broken, [_lead("roastery", "https://roastery.test")]))["roastery"]
+    check(again["fit_score"] == r["fit_score"], "analyst: fallback score is deterministic")
+
+    async def no_score(*_a, **_k):
+        return {"hooks": [], "summary": "looks great"}
+
+    r = (await _qualify_with(no_score, [_lead("roastery", "https://roastery.test")]))["roastery"]
+    check(r["fallback"] is True and r["summary"].startswith("Signals-only"), "analyst: LLM reply missing fit_score -> fallback")
+
+    async def bad_json(*_a, **_k):
+        raise ValueError("LLM did not return JSON")
+
+    r = (await _qualify_with(bad_json, [_lead("roastery", "https://roastery.test")]))["roastery"]
+    check(r["fallback"] is True, "analyst: bad JSON -> fallback")
+
+    crawl_stats.update(active=0, peak=0)
+    out = await lead_analyst.qualify_leads({"icp": ICP, "leads": [_lead(f"slow{i}", f"https://slow{i}.test")
+                                                                  for i in range(12)]})
+    check(crawl_stats["peak"] == lead_analyst.CRAWL_CONCURRENCY == 5 and len(out["reviews"]) == 12,
+          f"analyst: leads reviewed concurrently, at most 5 at a time (peak {crawl_stats['peak']})")
+
+    for bad in ({"icp": ICP}, {"leads": [_lead("x")]}):
+        try:
+            await lead_analyst.qualify_leads(bad)
+            check(False, f"analyst: bad args raise ValueError ({list(bad)})")
+        except ValueError:
+            check(True, f"analyst: bad args raise ValueError ({list(bad)})")
+
+
 @user.on_event("startup")
 async def run_script(ctx: Context):
     await asyncio.sleep(2)
@@ -355,9 +469,22 @@ async def run_script(ctx: Context):
         check(camp()["state"] == st.AWAIT_CONTACTS and {c["lead_id"] for c in camp()["contacts"]} == {"web:brew-lab-roasters"},
               "state AWAIT_CONTACTS with Brew Lab's contacts")
 
+        msg = await say(ctx, "approve", has_text("Lead reviews"))
+        check(msg is not None and card_meta(msg) and camp()["state"] == st.AWAIT_REVIEWS, "reviews card shown, AWAIT_REVIEWS")
+        reviews = camp()["reviews"]
+        brew = next((r for r in reviews if r["lead_id"] == "web:brew-lab-roasters"), {})
+        check(len(reviews) == len(camp()["leads"]) and brew.get("fallback") is False and brew.get("fit_score") == 81
+              and [h["evidence"] for h in brew.get("hooks", [])] == ["Orders: orders@brewlab.test"],
+              "every lead reviewed; Brew Lab keeps only its observed hook")
+        check(msg is not None and "Takes orders by email" in text_of(msg), "reviews card shows the top hook")
+        n = camp()["last_list"].index("web:brew-lab-roasters") + 1
+        msg = await say(ctx, f"show lead {n}", is_card("detail"))
+        check(msg is not None and "Orders: orders@brewlab.test" in text_of(msg)
+              and "https://brewlab.test/contact" in text_of(msg), "'show lead N' detail card shows evidence + URL")
+
         msg = await say(ctx, "approve", has_text("failed", "retry"))
-        check(msg is not None, "unimplemented reviews step fails gracefully with retry/skip")
-        check(camp()["state"] == st.STEP_FAILED and camp()["failed_gate"] == "reviews", "state STEP_FAILED")
+        check(msg is not None, "unimplemented drafts step fails gracefully with retry/skip")
+        check(camp()["state"] == st.STEP_FAILED and camp()["failed_gate"] == "drafts", "state STEP_FAILED")
 
         msg = await say(ctx, "stop asking me about contacts", has_text("auto-approve"))
         check(msg is not None and camp()["settings"]["ask_before"]["contacts"] is False, "NL settings change")
