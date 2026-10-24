@@ -80,6 +80,15 @@ def env_seconds(name: str, default: float) -> float:
     return value if value > 0 else default
 
 
+def env_int(name: str, default: int) -> int:
+    """A positive integer from the environment; missing, invalid or <= 0 -> default. Read at call time."""
+    try:
+        value = int(str(os.getenv(name, "") or default).strip())
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 def redact(text: str) -> str:
     """Strip API keys / bearer tokens from error text before it is logged or stored."""
     text = str(text)

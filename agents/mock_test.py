@@ -1552,10 +1552,118 @@ async def orchestrator_live_fix_tests():
         contact_finder.find_contacts = saved_find
 
 
+async def cap_tests():
+    """Daily IST campaign cap: per user, global env override, day rollover, no LLM when blocked."""
+    from common import env_int
+
+    sender = "agent1qcapuser"
+    calls = {"parse": 0, "icp": 0}
+
+    async def counting_parse(text, state, gate, numbered):
+        calls["parse"] += 1
+        return await fake_parse_intent(text, state, gate, numbered)
+
+    async def counting_icp(brief, city, profile):
+        calls["icp"] += 1
+        return dict(ICP, city=city)
+
+    saved_parse, saved_icp = llm.parse_intent, llm.build_icp
+    llm.parse_intent, llm.build_icp = counting_parse, counting_icp
+    saved_env = {k: os.environ.get(k) for k in ("MAX_CAMPAIGNS_PER_USER_PER_DAY", "MAX_CAMPAIGNS_PER_DAY")}
+    brief = "I sell organic coffee beans, find cafés in Jaipur"
+
+    def counts(ctx):
+        return ctx.storage.get(orchestrator.CAP_KEY)
+
+    try:
+        os.environ["MAX_CAMPAIGNS_PER_USER_PER_DAY"] = "0"
+        os.environ["MAX_CAMPAIGNS_PER_DAY"] = "nope"
+        check(env_int("MAX_CAMPAIGNS_PER_USER_PER_DAY", 3) == 3 and env_int("MAX_CAMPAIGNS_PER_DAY", 20) == 20,
+              "cap env: missing, 0 and non-int fall back to 3 and 20")
+        os.environ.pop("MAX_CAMPAIGNS_PER_USER_PER_DAY", None)
+        os.environ.pop("MAX_CAMPAIGNS_PER_DAY", None)
+
+        ctx = FakePayCtx()
+        await orchestrator.handle_chat(ctx, sender, chat_text("new campaign"))
+        check(st.load(ctx, sender)["state"] == st.SETUP and counts(ctx) is None,
+              "cap: the setup form is not a new campaign and is not counted")
+
+        for i in range(3):
+            camp = st.load(ctx, sender)
+            camp["state"] = st.DONE
+            st.save(ctx, sender, camp)
+            await orchestrator.handle_chat(ctx, sender, chat_text(brief))
+            camp = st.load(ctx, sender)
+            check(camp["state"] == st.AWAIT_ICP and bool(camp.get("campaign_id")), f"cap: campaign {i + 1} starts")
+        got = counts(ctx)
+        check(got["total"] == 3 and got["users"][sender] == 3 and got["day"] == orchestrator._ist_day(),
+              f"cap: 3 new campaigns counted for today ({got})")
+
+        parsed = calls["parse"]
+        ctx.sent.clear()
+        await orchestrator.handle_chat(ctx, sender, chat_text("status"))
+        check("Campaign status" in text_of(ctx.sent[-1][1]) and calls["parse"] == parsed,
+              "cap: in-campaign status still answered at the cap, with no LLM call")
+        await orchestrator.handle_chat(ctx, sender, chat_text("what about the weather today"))
+        check(counts(ctx)["users"][sender] == 3 and counts(ctx)["total"] == 3 and calls["parse"] == parsed + 1,
+              "cap: in-campaign chatter is not counted")
+
+        camp = st.load(ctx, sender)
+        old_id = camp["campaign_id"]
+        ctx.sent.clear()
+        await orchestrator.dispatch(ctx, sender, camp, {"intent": "start_campaign",
+                                                        "args": {"brief": "beans", "city": "Jaipur"}})
+        check(text_of(ctx.sent[-1][1]) == orchestrator.CAP_REPLY and counts(ctx)["total"] == 3
+              and camp["campaign_id"] == old_id and camp["state"] == st.AWAIT_ICP,
+              "cap: dispatch blocks start_campaign once the user cap is reached")
+
+        camp["state"] = st.DONE
+        st.save(ctx, sender, camp)
+        calls["parse"], calls["icp"] = 0, 0
+        ctx.sent.clear()
+        await orchestrator.handle_chat(ctx, sender, chat_text("help"))
+        check("LeadReach" in text_of(ctx.sent[-1][1]) and orchestrator.CAP_REPLY not in text_of(ctx.sent[-1][1])
+              and calls["parse"] == 0 and counts(ctx)["total"] == 3,
+              "cap: help still answered with no LLM call when the cap is reached")
+        ctx.sent.clear()
+        await orchestrator.handle_chat(ctx, sender, chat_text(brief))
+        check(calls["parse"] == 0 and calls["icp"] == 0 and text_of(ctx.sent[-1][1]) == orchestrator.CAP_REPLY
+              and counts(ctx)["users"][sender] == 3,
+              "cap: the 4th campaign is the exact limit reply and does not call the LLM")
+
+        os.environ["MAX_CAMPAIGNS_PER_DAY"] = "2"
+        ctx2 = FakePayCtx()
+        for who in ("agent1qglobala", "agent1qglobalb"):
+            await orchestrator.handle_chat(ctx2, who, chat_text(brief))
+            check(st.load(ctx2, who)["state"] == st.AWAIT_ICP, f"cap: global budget allows {who[-1]}")
+        calls["parse"], calls["icp"] = 0, 0
+        ctx2.sent.clear()
+        await orchestrator.handle_chat(ctx2, "agent1qglobalc", chat_text("please find me some leads"))
+        check(calls["parse"] == 0 and calls["icp"] == 0 and counts(ctx2)["total"] == 2
+              and text_of(ctx2.sent[-1][1]) == orchestrator.CAP_REPLY,
+              "cap: MAX_CAMPAIGNS_PER_DAY=2 blocks the next sender with zero LLM calls")
+
+        ctx2.storage.set(orchestrator.CAP_KEY, {"day": "1999-01-01", "total": 50, "users": {"agent1qglobalc": 50}})
+        calls["parse"] = 0
+        await orchestrator.handle_chat(ctx2, "agent1qglobalc", chat_text(brief))
+        fresh = counts(ctx2)
+        check(st.load(ctx2, "agent1qglobalc")["state"] == st.AWAIT_ICP and fresh["day"] == orchestrator._ist_day()
+              and fresh["total"] == 1 and fresh["users"] == {"agent1qglobalc": 1} and calls["icp"] == 1,
+              f"cap: a new IST day resets per-user and global counts ({fresh})")
+    finally:
+        llm.parse_intent, llm.build_icp = saved_parse, saved_icp
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 _saved_recipient = os.environ.pop("LEADPACK_RECIPIENT", None)  # the payment checks expect the default recipient
 _saved_default_recipient = orchestrator.payments.DEFAULT_RECIPIENT
 _pay_loop = asyncio.new_event_loop()  # a private loop: the Bureau's loop is left untouched
 try:
+    _pay_loop.run_until_complete(cap_tests())
     _pay_loop.run_until_complete(payment_tests())
     _pay_loop.run_until_complete(orchestrator_live_fix_tests())
 finally:

@@ -67,13 +67,17 @@ gates never depend on it.
 crawling confirms the business. We respect robots.txt and OSM usage policies, never scrape Google Maps, Justdial, Instagram and
 the like, and keep dry-run on by default.
 
+**Hosted demo cap:** the public demo starts at most 3 new campaigns per person and 20 in total each IST day
+(`MAX_CAMPAIGNS_PER_USER_PER_DAY`, `MAX_CAMPAIGNS_PER_DAY`). After that it asks you to try tomorrow or self-host with
+your own ASI:One key.
+
 ## Run it
 
 Requires Python 3.10–3.13 and [uv](https://docs.astral.sh/uv/) (`brew install uv`). `setup.sh` falls back to venv + pip without it.
 
 ```bash
 bash setup.sh                                  # deps, .env with fresh seeds + derived addresses, local git repo
-.venv/bin/python agents/mock_test.py           # offline end-to-end test (no keys needed), exit 0 = pass (159 checks)
+.venv/bin/python agents/mock_test.py           # offline end-to-end test (no keys needed), exit 0 = pass (174 checks)
 .venv/bin/ruff check agents scripts            # lint
 .venv/bin/python scripts/probe_sources.py Jodhpur salon  # checks OSM + ASI:One web search with your key
 .venv/bin/python agents/local_test.py "I sell a new trimmer - find salons in Jodhpur"   # live loop in the terminal

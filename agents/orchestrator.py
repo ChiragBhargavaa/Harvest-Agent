@@ -16,6 +16,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -35,6 +36,7 @@ from common import (
     ack,
     chat_text,
     env_bool,
+    env_int,
     env_seconds,
     redact,
     require_env,
@@ -88,6 +90,13 @@ HELP = (
     "- Anytime: **status**, **settings**, **pause** / **resume**, **log**\n"
     "- Trust a step? *\"stop asking me about contacts\"*"
 )
+CAP_KEY = "campaign_cap"
+CAP_REPLY = (
+    "Daily demo limit reached — try tomorrow, or self-host with your own ASI1 key: "
+    "https://github.com/ChiragBhargavaa/Harvest-Agent"
+)
+# Exact phrases still answered when the daily cap is reached and there is no active campaign.
+CAP_FREE_PHRASES = {"help", "status", "log", "show log"}
 
 agent = Agent(
     name=os.getenv("ORCH_NAME", "Harvest Agent"),
@@ -379,6 +388,51 @@ async def build_icp(ctx: Context, sender: str, camp: dict) -> None:
 
 # ---------------- handlers ----------------
 
+def _ist_day() -> str:
+    return datetime.now(st.IST).strftime("%Y-%m-%d")
+
+
+def campaign_counts(ctx: Context) -> dict:
+    """Today's new-campaign counts. A new IST day resets them. Shape: {day, total, users}."""
+    today = _ist_day()
+    raw = ctx.storage.get(CAP_KEY)
+    if not isinstance(raw, dict) or raw.get("day") != today:
+        return {"day": today, "total": 0, "users": {}}
+    users: dict[str, int] = {}
+    raw_users = raw.get("users") if isinstance(raw.get("users"), dict) else {}
+    for key, value in raw_users.items():
+        try:
+            users[str(key)] = int(value)
+        except (TypeError, ValueError):
+            continue
+    try:
+        total = int(raw.get("total") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    return {"day": today, "total": max(0, total), "users": users}
+
+
+def cap_reached(ctx: Context, sender: str) -> bool:
+    """True when this sender, or the whole demo, is at today's IST campaign cap. Read at call time."""
+    counts = campaign_counts(ctx)
+    user_max = env_int("MAX_CAMPAIGNS_PER_USER_PER_DAY", 3)
+    global_max = env_int("MAX_CAMPAIGNS_PER_DAY", 20)
+    return counts["users"].get(sender, 0) >= user_max or counts["total"] >= global_max
+
+
+def note_campaign(ctx: Context, sender: str) -> None:
+    """Count one new campaign for this sender. Call only where a campaign actually begins."""
+    counts = campaign_counts(ctx)
+    counts["total"] += 1
+    counts["users"][sender] = counts["users"].get(sender, 0) + 1
+    ctx.storage.set(CAP_KEY, counts)
+
+
+def _cap_free_phrase(text: str) -> bool:
+    low = MENTION_RE.sub("", text, count=1).strip().lower().strip(" .!")
+    return low in CAP_FREE_PHRASES
+
+
 async def start_campaign(ctx: Context, sender: str, camp: dict, args: dict) -> dict:
     brief = (args.get("brief") or "").strip()
     city = (args.get("city") or "").strip()
@@ -387,7 +441,11 @@ async def start_campaign(ctx: Context, sender: str, camp: dict, args: dict) -> d
         default_city = load_profile().get("targeting", {}).get("default_city")
         await ctx.send(sender, cards.setup_form(None if str(default_city).startswith("❓") else default_city))
         return camp
+    if cap_reached(ctx, sender):  # dispatch checks first; this guards a direct call
+        await ctx.send(sender, chat_text(CAP_REPLY))
+        return camp
     camp = st.new_campaign(camp)
+    note_campaign(ctx, sender)
     camp["brief"], camp["target"]["city"] = brief, city
     if args.get("limit"):
         camp["target"]["limit"] = max(1, min(int(float(args["limit"])), 15))
@@ -629,7 +687,10 @@ async def dispatch(ctx: Context, sender: str, camp: dict, cmd: dict) -> dict:
         else:
             await ctx.send(sender, chat_text("Nothing is paused."))
     elif intent == "start_campaign":
-        camp = await start_campaign(ctx, sender, camp, args)
+        if cap_reached(ctx, sender):
+            await ctx.send(sender, chat_text(CAP_REPLY))
+        else:
+            camp = await start_campaign(ctx, sender, camp, args)
     elif camp["state"] == st.STEP_FAILED and intent in ("retry", "approve"):
         await run_from(ctx, sender, camp, camp.get("failed_gate") or "icp")
     elif camp["state"] == st.STEP_FAILED and intent == "skip":
@@ -670,6 +731,10 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
         return
     ctx.logger.info(f"user {sender[:16]}...: {text[:200]}")
     camp = st.load(ctx, sender)
+    # No active campaign and the daily cap is full: don't call understand() or the LLM.
+    if camp["state"] in (st.IDLE, st.SETUP, st.DONE) and cap_reached(ctx, sender) and not _cap_free_phrase(text):
+        await ctx.send(sender, chat_text(CAP_REPLY))
+        return
     try:
         cmd = await understand(text, camp)
         ctx.logger.info(f"intent: {cmd}")

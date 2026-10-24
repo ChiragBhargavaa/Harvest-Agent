@@ -374,6 +374,14 @@ ANY --pause--> PAUSED (paused_from);  PAUSED --resume--> paused_from (re-shows t
 ANY --status--> status detail card;  --log--> last 10 audit entries
 ```
 
+**Daily demo cap** (`campaign_cap` in `ctx.storage`): new campaigns per sender per IST day
+(`MAX_CAMPAIGNS_PER_USER_PER_DAY`, default 3) and globally per IST day (`MAX_CAMPAIGNS_PER_DAY`, default 20). Both are
+read at call time (`env_int`). The stored shape is `{"day": "YYYY-MM-DD", "total": n, "users": {sender: n}}`; a new IST
+day resets it. The count increments only when `start_campaign` actually calls `new_campaign` (a brief and a city). With
+no active campaign (`IDLE`, `SETUP`, `DONE`) and either cap reached, `handle_chat` replies with the exact daily-limit
+sentence and returns before `understand()` / the LLM. **help**, **status** and **log** / **show log** still answer.
+`dispatch` checks again before `start_campaign`. Messages inside an active campaign are not counted and not blocked.
+
 ### 3.10 Intent handling (`orchestrator.understand`)
 1. **Card action:** text that parses as JSON with an `"action"` key. Every card selection carries `"action"` and `"step"`.
 2. **Fast path (no LLM):** exact phrases (`approve`, `approve all`, `redo`, `retry`, `skip`, `pause`, `resume`, `status`, `help`,
@@ -516,6 +524,8 @@ latest year seen, keyword flags (online ordering, menu, events, catering), app-s
 | `LEADREACH_WEB_SEARCH_TIMEOUT` | Optional: seconds per lead-finder web-search call (default 90) |
 | `LEADREACH_DRAFT_LLM_TIMEOUT` | Optional: seconds per copywriter `llm.draft_email` attempt (default 40; invalid or ≤0 → default) |
 | `RESEND_API_KEY`, `SENDER_FROM`, `REPLY_TO`, `DRY_RUN`, `TEST_REDIRECT_TO`, `DAILY_CAP` | Sending + safety defaults |
+| `MAX_CAMPAIGNS_PER_USER_PER_DAY` | New campaigns per sender per IST day (default 3; invalid or ≤0 → default). Hosted demo cap |
+| `MAX_CAMPAIGNS_PER_DAY` | New campaigns for the whole demo per IST day (default 20; invalid or ≤0 → default) |
 
 ### 3.17 File layout
 ```
@@ -544,7 +554,7 @@ Shared modules are fine for mailbox agents run from this repo. If an agent moves
 helpers into one file (§4.7).
 
 ### 3.18 Milestones and acceptance tests
-**Mock test** ✅ (`agents/mock_test.py`, 159 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
+**Mock test** ✅ (`agents/mock_test.py`, 174 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
 fetcher and `mx_ok` are monkeypatched; all agents + a scripted user run in a `Bureau(port=8010)`; exit code 0 = pass.
 
 | Milestone | Done when |
