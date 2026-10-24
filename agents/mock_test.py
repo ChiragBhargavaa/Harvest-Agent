@@ -112,7 +112,7 @@ SITES = {
         _page("https://brewlab.test/contact", "Orders: orders@brewlab.test, call +91 98290 11111. "
                                               "Website by studio@webcraft.test"),
     ],
-    "beanhouse.test": [_page("https://beanhouse.test/", "Bean House. Email beanhouse.jaipur@gmail.com")],
+    "beanhouse.test": [_page("https://beanhouse.test/", "Bean House. Email salon@freemail.test")],
     "quiet.test": [_page("https://quiet.test/", "We roast quietly. Visit us.")],
     "deadmx.test": [_page("https://deadmx.test/", "info@deadmx.test")],
     "linkhub.test": [_page("https://www.instagram.com/somecafe", "Follow us")],  # redirects to a banned host
@@ -489,7 +489,12 @@ async def contact_unit_tests():
         _lead("linkhub", "https://linkhub.test"),
     ]
     mx_calls.clear()
-    out = await contact_finder.find_contacts({"leads": leads, "max_pages_per_site": 5})
+    saved_freemail = contact_finder.FREEMAIL
+    contact_finder.FREEMAIL = (*saved_freemail, "freemail.test")  # fixture free-mail domain; no real address
+    try:
+        out = await contact_finder.find_contacts({"leads": leads, "max_pages_per_site": 5})
+    finally:
+        contact_finder.FREEMAIL = saved_freemail
     by_email = {c["email"]: c for c in out["contacts"]}
     conf = {e: c["confidence"] for e, c in by_email.items()}
 
@@ -497,7 +502,7 @@ async def contact_unit_tests():
           "contacts: owner/orders email on own domain -> high")
     check(conf.get("hello@brewlab.test") == "medium" and by_email["hello@brewlab.test"]["role"] == "info",
           "contacts: generic email on own domain (de-obfuscated) -> medium")
-    check(conf.get("beanhouse.jaipur@gmail.com") == "medium", "contacts: free-mail on own site -> medium")
+    check(conf.get("salon@freemail.test") == "medium", "contacts: free-mail on own site -> medium (fixture domain)")
     check(conf.get("studio@webcraft.test") == "low", "contacts: another domain's email on the site -> low")
     curious = by_email.get("hello@curiousbeans.test", {})
     check(curious.get("source") == "osm" and curious.get("confidence") == "low"
@@ -741,7 +746,7 @@ async def copywriter_live_fix_tests(args: dict):
     """Live run: 2 of 3 leads 'failed' with no ASI:One request logged = their calls outlived the 25 s timeout."""
     leads = [_lead("umaid"), _lead("marc"), _lead("halflight")]
     contacts = [{"lead_id": "umaid", "email": "info@umaidmahal.test", "confidence": "medium", "source": "website"},
-                {"lead_id": "marc", "email": "hotelmarcinn@gmail.com", "confidence": "low", "source": "website"},
+                {"lead_id": "marc", "email": "marc@example.test", "confidence": "low", "source": "website"},
                 {"lead_id": "halflight", "email": "info@halflight.test", "confidence": "low", "source": "osm"}]
     live = dict(args, leads=leads, contacts=contacts, reviews=[])
     started: list[str] = []

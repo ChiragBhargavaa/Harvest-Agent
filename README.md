@@ -22,12 +22,12 @@ Addresses are fixed by the seeds in `.env` (keep that file; `bash setup.sh` prin
 
 | Agent | Name | Role | Status | Address | Agentverse profile |
 |---|---|---|---|---|---|
-| Orchestrator | `leadreach` | Talks to the brand in ASI:One (Chat Protocol + Interactive Cards), builds the ideal-customer profile, runs the approval gates, edits drafts, audit log | ✅ implemented | `agent1q0nlrk0hsqgn9l85z8thxmr5tltjqxeqsmjw4zzme389dcw7zkudjq3lk23` | `<url>` |
-| Lead Finder | `leadreach-finder` | Finds local businesses: OpenStreetMap + ASI:One web search, verifies websites by crawling | ✅ implemented | `agent1q06nvrv65ewr9g62te9xrhqgc7hu8kc3823rrvtttu33nsk4krek2w4cz0d` | `<url>` |
-| Contact Finder | `leadreach-contacts` | Published emails/phones by polite crawling + MX check, confidence + source URL per contact | ✅ implemented | `agent1qdr009c63xpzznwt07k62vxg5fzpr3kf89s65ckz0rjda2ls3s4evf2v4c8` | `<url>` |
-| Lead Analyst | `leadreach-analyst` | Fit score + evidence-backed hooks from each website (signals-only fallback) | ✅ implemented | `agent1qd8k32878hmz7jc4cw0cr6mv9q6eqa24xrac6cqxeg0c0kdjf4guj05wpl9` | `<url>` |
-| Copywriter | `leadreach-writer` | Short personal drafts (ASI:One) + deterministic validator | ✅ implemented | `agent1q2ttlc7yh8dwy4vj8knr6jhmguy9pcp0a8zawtwnf3up26zgdq6qsaech9t` | `<url>` |
-| Sender (stretch) | `leadreach-sender` | Placeholder: runs and answers, but `send_emails` replies "not implemented yet"; nothing is ever sent | ⏸ not part of this demo (DRY_RUN only) | `agent1q007hz3k52l3pjuwxxfrn28a6xv768alq5jygldx3x7ae6had0d47gtw337` | `<url>` |
+| Orchestrator | `leadreach` | Talks to the brand in ASI:One (Chat Protocol + Interactive Cards), builds the ideal-customer profile, runs the approval gates, edits drafts, audit log | ✅ implemented | `agent1q0nlrk0hsqgn9l85z8thxmr5tltjqxeqsmjw4zzme389dcw7zkudjq3lk23` | `<paste>` |
+| Lead Finder | `leadreach-finder` | Finds local businesses: OpenStreetMap + ASI:One web search, verifies websites by crawling | ✅ implemented | `agent1q06nvrv65ewr9g62te9xrhqgc7hu8kc3823rrvtttu33nsk4krek2w4cz0d` | `<paste>` |
+| Contact Finder | `leadreach-contacts` | Published emails/phones by polite crawling + MX check, confidence + source URL per contact | ✅ implemented | `agent1qdr009c63xpzznwt07k62vxg5fzpr3kf89s65ckz0rjda2ls3s4evf2v4c8` | `<paste>` |
+| Lead Analyst | `leadreach-analyst` | Fit score + evidence-backed hooks from each website (signals-only fallback) | ✅ implemented | `agent1qd8k32878hmz7jc4cw0cr6mv9q6eqa24xrac6cqxeg0c0kdjf4guj05wpl9` | `<paste>` |
+| Copywriter | `leadreach-writer` | Short personal drafts (ASI:One) + deterministic validator | ✅ implemented | `agent1q2ttlc7yh8dwy4vj8knr6jhmguy9pcp0a8zawtwnf3up26zgdq6qsaech9t` | `<paste>` |
+| Sender (stretch) | `leadreach-sender` | Placeholder: runs and answers, but `send_emails` replies "not implemented yet"; nothing is ever sent | ⏸ not part of this demo (DRY_RUN only) | `agent1q007hz3k52l3pjuwxxfrn28a6xv768alq5jygldx3x7ae6had0d47gtw337` | `<paste>` |
 
 The demo workflow ends at approved drafts. At the send checkpoint the orchestrator reports that sending isn't available and
 offers **skip** to finish the campaign. Sending (M6) and the M5 extras (`add lead`, `import list`, reply classification) are
@@ -38,7 +38,7 @@ out of scope for this submission.
 - **Problem:** small brands that sell to local businesses (cafés, salons, gyms, retailers) spend hours per lead finding the right
   businesses, a real contact email, and a reason to write. Lead databases barely cover Indian SMBs, and autopilot AI outreach
   tools send wrong emails without asking.
-- **Who it's for:** founders and small sales teams of B2B brands selling locally, e.g. a coffee roaster selling to cafés.
+- **Who it's for:** founders and small sales teams of B2B brands selling locally, e.g. a grooming-products brand selling a new trimmer to salons.
 - **Outcome of one ASI:One conversation:** an approved list of local leads with sources, verified published contacts, evidence-based
   reviews, and approved personal email drafts (LeadReach does not send them in this demo).
 
@@ -73,10 +73,10 @@ Requires Python 3.10–3.13 and [uv](https://docs.astral.sh/uv/) (`brew install 
 
 ```bash
 bash setup.sh                                  # deps, .env with fresh seeds + derived addresses, local git repo
-.venv/bin/python agents/mock_test.py           # offline end-to-end test (no keys needed), exit 0 = pass (110 checks)
+.venv/bin/python agents/mock_test.py           # offline end-to-end test (no keys needed), exit 0 = pass (128 checks)
 .venv/bin/ruff check agents scripts            # lint
-.venv/bin/python scripts/probe_sources.py Jaipur cafe   # checks OSM + ASI:One web search with your key
-.venv/bin/python agents/local_test.py "I sell organic coffee beans - find cafés in Jaipur"   # live loop in the terminal
+.venv/bin/python scripts/probe_sources.py Jodhpur salon  # checks OSM + ASI:One web search with your key
+.venv/bin/python agents/local_test.py "I sell a new trimmer - find salons in Jodhpur"   # live loop in the terminal
 ```
 
 **Live on Agentverse / ASI:One:** start all 6 agents with one supervisor (restarts any agent that exits; Ctrl+C stops all):
