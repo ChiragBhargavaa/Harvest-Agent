@@ -13,7 +13,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import date
-from urllib.parse import urljoin, urlparse, urlsplit
+from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
 import aiohttp
@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover
 
 # ======================= hosted runtime glue (replaces common.py) =======================
 # Agentverse hosted: the global `agent` is pre-provided. No Agent(...), no agent.run(), no .env, no local files.
+agent = agent  # noqa: F821
 
 class ToolRequest(Model):
     tool: str              # "find_leads" | "find_contacts" | "qualify_leads" | "draft_emails" | "send_emails"
@@ -821,7 +822,24 @@ async def _llm_review(icp: dict, lead: dict, signals: dict, pages: list[Page]) -
     return {"fit_score": score, "hooks": hooks, "summary": _words(data.get("summary"), 40)}
 
 
-async def review_lead(icp: dict, lead: dict, fetcher, sem: asyncio.Semaphore) -> dict:
+def _attach_channels(signals: dict, lead: dict, contact: dict | None) -> dict:
+    """Published phone, website, Instagram and Facebook. Nothing is filled in when it was not published."""
+    signals = dict(signals or {})
+    contact = contact or {}
+    phones = list(contact.get("phones") or [])
+    if not phones and lead.get("phone"):
+        phones = [lead.get("phone")]
+    if phones and (contact.get("phones") or not signals.get("phones")):
+        signals["phones"] = phones
+    for key in ("website", "instagram", "facebook"):
+        if contact.get(key):
+            signals[key] = contact[key]
+        elif not signals.get(key) and lead.get(key):
+            signals[key] = lead[key]
+    return signals
+
+
+async def review_lead(icp: dict, lead: dict, fetcher, sem: asyncio.Semaphore, contact: dict | None = None) -> dict:
     website = normalise_url(lead.get("website"))
     pages, reason = [], None
     async with sem:  # <=5 leads crawled + scored at a time
@@ -831,7 +849,7 @@ async def review_lead(icp: dict, lead: dict, fetcher, sem: asyncio.Semaphore) ->
             reason = "banned_host"
         else:
             pages, reason = await _crawl(fetcher, website)
-        signals = merged_signals(pages) if pages else {}
+        signals = _attach_channels(merged_signals(pages) if pages else {}, lead, contact)
         review = await _llm_review(icp, lead, signals, pages) if pages else None
     fallback = review is None
     score, summary = signals_review(icp, lead, signals, pages)
@@ -853,16 +871,22 @@ async def qualify_leads(args: dict) -> dict:
     if not isinstance(icp, dict):
         raise ValueError("missing 'icp'")
     sem = asyncio.Semaphore(CRAWL_CONCURRENCY)
+    by_lead = {}
+    for contact in args.get("contacts") or []:
+        if isinstance(contact, dict):
+            by_lead.setdefault(contact.get("lead_id"), contact)
     start = time.monotonic()
 
     async with PoliteFetcher() as fetcher:  # one fetcher: shared robots cache + per-domain rate limit
         async def one(lead: dict) -> dict:
+            contact = by_lead.get(lead["id"])
             try:
-                return await review_lead(icp, lead, fetcher, sem)
+                return await review_lead(icp, lead, fetcher, sem, contact)
             except Exception:  # noqa: BLE001 - a per-lead failure never fails the whole step
-                score, summary = signals_review(icp, lead, {}, [])
-                return {"lead_id": lead["id"], "reachable": False, "unreachable_reason": "unreachable", "signals": {},
-                        "fit_score": score, "hooks": [], "summary": summary, "fallback": True}
+                signals = _attach_channels({}, lead, contact)
+                score, summary = signals_review(icp, lead, signals, [])
+                return {"lead_id": lead["id"], "reachable": False, "unreachable_reason": "unreachable",
+                        "signals": signals, "fit_score": score, "hooks": [], "summary": summary, "fallback": True}
 
         tasks = [asyncio.create_task(one(lead)) for lead in leads]
         _, pending = await asyncio.wait(tasks, timeout=ANALYST_BUDGET_S)

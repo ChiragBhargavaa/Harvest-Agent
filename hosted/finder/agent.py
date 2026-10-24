@@ -535,6 +535,8 @@ def _to_lead(el: dict) -> dict | None:
         "website": t.get("website") or t.get("contact:website"),
         "osm_emails": [e.strip() for e in (t.get("email") or t.get("contact:email") or "").split(";") if e.strip()],
         "phone": t.get("phone") or t.get("contact:phone"),
+        "instagram": t.get("contact:instagram"),
+        "facebook": t.get("contact:facebook"),
         "source": "osm",
         "source_ref": osm_ref,
     }
