@@ -257,6 +257,9 @@ The ≤3 `search_queries` run `llm.discover_businesses` **concurrently** and are
 query becomes a `source_notes` entry ("Web search failed for '<query>': ..."), never a step failure.
 An OSM `website`/`contact:website` tag on a banned host (§3.13, e.g. a zomato.com page) is treated as no website: it is
 never shown or crawled, and a `source_notes` entry counts them.
+After website verification, `dedupe_leads` keeps the best-ranked lead per website domain (`www.`/scheme/path ignored) or
+normalised name; a dropped duplicate's missing website/phone and its `osm_emails` move to the kept lead, and a `source_notes`
+entry counts the merges.
 **`find_contacts`** ✅ implemented (M2)
 ```jsonc
 {"leads": [Lead], "max_pages_per_site": 5}
