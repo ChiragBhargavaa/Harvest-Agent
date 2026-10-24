@@ -2046,22 +2046,65 @@ def _pending_key(sender: str) -> str:
     return f"payment:{sender}"
 
 
+def _fetch_wallet(value) -> str | None:
+    """A fetch1… address from a hosted wallet.
+
+    Agentverse hosted code uses ``ctx.wallet`` as the Fetch address (see the allowed-imports
+    example: ``ledger.query_bank_balance(ctx.wallet)``). A local uagents ``Agent.wallet`` is a
+    cosmpy ``LocalWallet`` whose ``address()`` returns an ``Address`` (a ``UserString``, not a
+    ``str``). Either form counts. Anything else is ignored.
+    """
+    if value is None:
+        return None
+    current = value
+    if callable(current):
+        try:
+            current = current()
+        except Exception:  # noqa: BLE001 - a wallet getter must not break the card
+            return None
+    address = getattr(current, "address", None)
+    if callable(address):
+        try:
+            current = address()
+        except Exception:  # noqa: BLE001
+            return None
+    text = str(current).strip()
+    return text if RECIPIENT_RE.fullmatch(text) else None
+
+
 def wallet_address(ctx: Context) -> str:
+    """LEADPACK_RECIPIENT, else the hosted Fetch wallet, else the agent address."""
     override = os.getenv("LEADPACK_RECIPIENT", "").strip()
     if override and RECIPIENT_RE.fullmatch(override):
         return override
     if override:
         ctx.logger.warning("LEADPACK_RECIPIENT ignored: not a fetch1… wallet address")
-    candidates = [getattr(ctx, "wallet", None), getattr(getattr(ctx, "agent", None), "wallet", None)]
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        addr = candidate() if callable(candidate) else candidate
-        if hasattr(addr, "address"):
-            addr = addr.address() if callable(addr.address) else addr.address
-        if isinstance(addr, str) and RECIPIENT_RE.fullmatch(addr):
-            return addr
-    return str(getattr(getattr(ctx, "agent", None), "address", "") or "")
+    # ctx.agent is an AgentRepresentation and has no wallet in uagents 0.26.1.
+    # The hosted runtime puts the Fetch wallet on ctx.wallet; a local Agent puts it on agent.wallet.
+    for source in (
+        getattr(ctx, "wallet", None),
+        getattr(getattr(ctx, "agent", None), "wallet", None),
+        getattr(agent, "wallet", None),
+    ):
+        found = _fetch_wallet(source)
+        if found:
+            return found
+    agent_addr = getattr(getattr(ctx, "agent", None), "address", None)
+    if callable(agent_addr):
+        try:
+            agent_addr = agent_addr()
+        except Exception:  # noqa: BLE001
+            agent_addr = None
+    if not agent_addr:
+        agent_addr = getattr(agent, "address", "")
+    return str(agent_addr or "")
+
+
+def recipient_label(recipient: str) -> str:
+    """A fetch1… address is a wallet. An agent1… address is who to pay, not a wallet."""
+    if RECIPIENT_RE.fullmatch(recipient or ""):
+        return "Recipient wallet"
+    return "Pay to agent"
 
 
 def pack_rows(camp: dict) -> list[str]:
@@ -2094,9 +2137,10 @@ def lead_pack_request(ctx: Context, camp: dict) -> RequestPayment:
 def lead_pack_card(req: RequestPayment) -> ChatMessage:
     """Chat card with the payment details. Sent before the RequestPayment envelope."""
     funds = req.accepted_funds[0]
+    recipient = req.recipient or ""
     rows = [
         {"label": "Amount", "value": f"{funds.amount} {funds.currency}"},
-        {"label": "Recipient", "value": req.recipient or "-"},
+        {"label": recipient_label(recipient), "value": recipient or "-"},
         {"label": "Reference", "value": req.reference or "-"},
         {"label": "Verification", "value": "Demo only, no real funds move"},
     ]
