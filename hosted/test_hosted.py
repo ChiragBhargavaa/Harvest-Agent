@@ -1,5 +1,6 @@
 """Offline checks for the hosted Harvest Agent. No network and no real LLM calls."""
 
+import ast
 import asyncio
 import importlib.util
 import json
@@ -132,6 +133,27 @@ def test_file_compiles_and_protocols_match():
     assert mod.REQUEST_ID_KEY == "_request_id"
     assert "❓" in mod.BRAND_PROFILE["brand"]["name"]
     assert mod.BRAND_PROFILE["pricing"]["mention_price"] is False
+
+
+def test_logger_calls_take_one_message():
+    """Hosted ctx.logger rejects %-style extra positional args."""
+    tree = ast.parse(AGENT_PATH.read_text())
+    methods = {"debug", "info", "warning", "error", "exception", "critical", "log"}
+    bad = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr not in methods:
+            continue
+        recv = node.func.value
+        is_logger = (
+            (isinstance(recv, ast.Attribute) and recv.attr == "logger")
+            or (isinstance(recv, ast.Name) and recv.id in {"log", "logger", "logging"})
+            or (isinstance(recv, ast.Attribute) and isinstance(recv.value, ast.Name) and recv.value.id == "logging")
+        )
+        if is_logger and len(node.args) > 1:
+            bad.append(f"{node.lineno}:{node.func.attr} has {len(node.args)} positional args")
+    assert bad == [], bad
 
 
 def test_help_replies():
@@ -416,6 +438,7 @@ def test_remote_success_skips_inline():
 
 if __name__ == "__main__":
     test_file_compiles_and_protocols_match()
+    test_logger_calls_take_one_message()
     test_help_replies()
     test_cap_blocks_before_llm()
     test_per_user_cap_and_active_campaign_not_counted()
