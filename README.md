@@ -18,11 +18,12 @@
 
 ## Agents
 
-Addresses are fixed by the seeds in `.env` (keep that file; `bash setup.sh` prints them). Each agent is connected via mailbox and listed on Agentverse.
+Chat with the hosted **Harvest Agent** (first row) on ASI:One. The mailbox rows under it, including **Harvest Agent (local backup)**, keep the addresses from the seeds in `.env` (keep that file; `bash setup.sh` prints them).
 
 | Agent | Name | Role | Status | Address | Agentverse profile |
 |---|---|---|---|---|---|
-| Orchestrator | `Harvest Agent` | Talks to the brand in ASI:One (Chat Protocol + Interactive Cards), builds the ideal-customer profile, runs the approval gates, edits drafts, audit log | ✅ implemented | `agent1q0nlrk0hsqgn9l85z8thxmr5tltjqxeqsmjw4zzme389dcw7zkudjq3lk23` | [profile](https://agentverse.ai/agents/details/agent1q0nlrk0hsqgn9l85z8thxmr5tltjqxeqsmjw4zzme389dcw7zkudjq3lk23/profile) |
+| Orchestrator | `Harvest Agent` | Talks to the brand in ASI:One (Chat Protocol + Interactive Cards), builds the ideal-customer profile, runs the approval gates, edits drafts, audit log | ✅ implemented | `agent1qfzd2jf0p9wn3mpc2thae0mu4r64yrzrpggzs9uklnae2f97n3r4glcuhx5` | [profile](https://agentverse.ai/agents/details/agent1qfzd2jf0p9wn3mpc2thae0mu4r64yrzrpggzs9uklnae2f97n3r4glcuhx5/profile) |
+| Orchestrator | `Harvest Agent (local backup)` | Talks to the brand in ASI:One (Chat Protocol + Interactive Cards), builds the ideal-customer profile, runs the approval gates, edits drafts, audit log | ✅ implemented | `agent1q0nlrk0hsqgn9l85z8thxmr5tltjqxeqsmjw4zzme389dcw7zkudjq3lk23` | [profile](https://agentverse.ai/agents/details/agent1q0nlrk0hsqgn9l85z8thxmr5tltjqxeqsmjw4zzme389dcw7zkudjq3lk23/profile) |
 | Lead Finder | `leadreach-finder` | Finds local businesses: OpenStreetMap + ASI:One web search, verifies websites by crawling | ✅ implemented | `agent1q06nvrv65ewr9g62te9xrhqgc7hu8kc3823rrvtttu33nsk4krek2w4cz0d` | [profile](https://agentverse.ai/agents/details/agent1q06nvrv65ewr9g62te9xrhqgc7hu8kc3823rrvtttu33nsk4krek2w4cz0d/profile) |
 | Contact Finder | `leadreach-contacts` | Published emails/phones by polite crawling + MX check, confidence + source URL per contact | ✅ implemented | `agent1qdr009c63xpzznwt07k62vxg5fzpr3kf89s65ckz0rjda2ls3s4evf2v4c8` | [profile](https://agentverse.ai/agents/details/agent1qdr009c63xpzznwt07k62vxg5fzpr3kf89s65ckz0rjda2ls3s4evf2v4c8/profile) |
 | Lead Analyst | `leadreach-analyst` | Fit score + evidence-backed hooks from each website (signals-only fallback) | ✅ implemented | `agent1qd8k32878hmz7jc4cw0cr6mv9q6eqa24xrac6cqxeg0c0kdjf4guj05wpl9` | [profile](https://agentverse.ai/agents/details/agent1qd8k32878hmz7jc4cw0cr6mv9q6eqa24xrac6cqxeg0c0kdjf4guj05wpl9/profile) |
@@ -32,11 +33,11 @@ Addresses are fixed by the seeds in `.env` (keep that file; `bash setup.sh` prin
 ### Hosted on Agentverse
 
 The same specialists also run as Agentverse **hosted** agents (same `leadreach-tools` v0.1.0 protocol; the hosted sender
-never sends email). The hosted orchestrator address is coming soon; until then the orchestrator above is the entry point.
+never sends email). Chat with **Harvest Agent** in this table; it is the main agent for the demo.
 
 | Agent | Name | Address | Agentverse profile |
 |---|---|---|---|
-| Orchestrator | `Harvest Agent` (hosted) | coming soon | — |
+| Orchestrator | `Harvest Agent` | `agent1qfzd2jf0p9wn3mpc2thae0mu4r64yrzrpggzs9uklnae2f97n3r4glcuhx5` | [profile](https://agentverse.ai/agents/details/agent1qfzd2jf0p9wn3mpc2thae0mu4r64yrzrpggzs9uklnae2f97n3r4glcuhx5/profile) |
 | Lead Finder | `Harvest Finder` (hosted) | `agent1qtxuptksgslfrj69elx4pn4gkll007t0ve7spxl9tjkej8ck0gqusqk2ftn` | [profile](https://agentverse.ai/agents/details/agent1qtxuptksgslfrj69elx4pn4gkll007t0ve7spxl9tjkej8ck0gqusqk2ftn/profile) |
 | Contact Finder | `Harvest Contacts` (hosted) | `agent1q28zez90a936easmmmvnnu27seet374mk3geynhynr4ewhxvuryygqj6z4x` | [profile](https://agentverse.ai/agents/details/agent1q28zez90a936easmmmvnnu27seet374mk3geynhynr4ewhxvuryygqj6z4x/profile) |
 | Lead Analyst | `Harvest Analyst` (hosted) | `agent1qv6pdx6q5wjt0xjf5xqe9790tfj88wcwq4np3npsrcec7pv2xpxw6hf3hye` | [profile](https://agentverse.ai/agents/details/agent1qv6pdx6q5wjt0xjf5xqe9790tfj88wcwq4np3npsrcec7pv2xpxw6hf3hye/profile) |
@@ -97,13 +98,15 @@ bash setup.sh                                  # deps, .env with fresh seeds + d
 .venv/bin/python agents/local_test.py "I sell a new trimmer - find salons in Jodhpur"   # live loop in the terminal
 ```
 
-**Live on Agentverse / ASI:One:** start all 6 agents with one supervisor (restarts any agent that exits; Ctrl+C stops all):
+**Live on Agentverse / ASI:One:** chat with the hosted [Harvest Agent](https://agentverse.ai/agents/details/agent1qfzd2jf0p9wn3mpc2thae0mu4r64yrzrpggzs9uklnae2f97n3r4glcuhx5/profile) (`agent1qfzd2jf0p9wn3mpc2thae0mu4r64yrzrpggzs9uklnae2f97n3r4glcuhx5`). Open that profile and use **Chat with Agent**.
+
+To run the local mailbox backup instead, start all 6 agents with one supervisor (restarts any agent that exits; Ctrl+C stops all):
 ```bash
 .venv/bin/python scripts/run_all.py
 ```
 Or run a single agent on its own, e.g. `.venv/bin/python agents/orchestrator.py` (likewise `lead_finder`, `contact_finder`,
 `lead_analyst`, `copywriter`, `sender`). Open each agent's **Agent Inspector** link from the logs → **Connect** → **Mailbox**.
-Then, on Agentverse, edit the orchestrator's profile and use **Chat with Agent** to open it in ASI:One.
+Then, on Agentverse, edit the **Harvest Agent (local backup)** profile and use **Chat with Agent** to open it in ASI:One.
 
 To keep the agents online, run `python scripts/run_all.py` on any always-on machine with the same `.env` (same seeds keep the
 addresses). Keep `DRY_RUN=true`.

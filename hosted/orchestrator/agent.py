@@ -1162,7 +1162,7 @@ async def find_leads(args: dict, ctx=None) -> dict:
     else:
         place, osm = await _osm(icp, city, discover_limit, notes, ctx)
         web = []
-    log.info("find_leads osm=%s web_queries=%s in %.1fs", len(osm), len(queries), time.monotonic() - start)
+    log.info(f"find_leads osm={len(osm)} web_queries={len(queries)} in {time.monotonic() - start:.1f}s")
     banned_osm = 0
     for lead in osm:
         url = normalise_url(lead.get("website"))
@@ -1220,7 +1220,8 @@ async def find_leads(args: dict, ctx=None) -> dict:
     call_list = [lead for lead in shortlist if lead not in picked and lead.get("phone")][:limit]
     if len(picked) < limit:
         notes.append(f"Only {len(picked)} leads have a website or email; {len(call_list)} more have just a phone.")
-    log.info("find_leads done: %s leads, %s phone-only (%.1fs)", len(picked), len(call_list), time.monotonic() - start)
+    log.info(f"find_leads done: {len(picked)} leads, {len(call_list)} phone-only "
+             f"({time.monotonic() - start:.1f}s)")
     if not picked and not call_list:
         raise RuntimeError("no leads found: " + " ".join(notes)[:300])
     return {"leads": picked, "call_list": call_list, "source_notes": notes, "city": place.get("name") or city}
@@ -1365,7 +1366,8 @@ async def find_contacts(args: dict, ctx=None) -> dict:
         contacts += found
         if reason and not found:
             skipped.append({"lead_id": lead["id"], "reason": reason})
-    log.info("find_contacts done in %.1fs: %s contacts, %s skipped", time.monotonic() - start, len(contacts), len(skipped))
+    log.info(f"find_contacts done in {time.monotonic() - start:.1f}s: "
+             f"{len(contacts)} contacts, {len(skipped)} skipped")
     return {"contacts": contacts, "skipped": skipped}
 
 
@@ -1579,7 +1581,7 @@ async def qualify_leads(args: dict, ctx=None) -> dict:
         await asyncio.gather(*pending, return_exceptions=True)
     reviews = [timed_out_review(lead) if task in pending else task.result()
                for lead, task in zip(leads, tasks, strict=True)]
-    log.info("qualify_leads done in %.1fs: %s reviews", time.monotonic() - start, len(reviews))
+    log.info(f"qualify_leads done in {time.monotonic() - start:.1f}s: {len(reviews)} reviews")
     return {"reviews": sorted(reviews, key=lambda r: -r["fit_score"])}
 
 
@@ -1725,7 +1727,7 @@ async def draft_one(profile, lead, contact, review, style_rules, sem, product=""
         try:
             raw = await _llm_draft(profile, lead, review, style_rules, product, brief)
         except Exception as err:  # noqa: BLE001
-            log.warning("no draft for %s: %s", lead["id"], _draft_why(err))
+            log.warning(f"no draft for {lead['id']}: {_draft_why(err)}")
             return None, {"lead_id": lead["id"], "reason": "llm_failed", "detail": _draft_why(err)}
         problems = validate(raw, profile, review, said)
         if any(PROFILE_GAP not in problem for problem in problems):
@@ -1733,7 +1735,8 @@ async def draft_one(profile, lead, contact, review, style_rules, sem, product=""
                 retry = await _llm_draft(profile, lead, review, style_rules, product, brief, problems=problems)
                 raw, problems = retry, validate(retry, profile, review, said)
             except Exception as err:  # noqa: BLE001
-                log.warning("regenerating the draft for %s failed, keeping the first one: %s", lead["id"], _draft_why(err))
+                log.warning(f"regenerating the draft for {lead['id']} failed, keeping the first one: "
+                            f"{_draft_why(err)}")
     return _as_draft(lead["id"], contact["email"], raw, problems), None
 
 
@@ -1790,7 +1793,7 @@ async def send_emails(args: dict, ctx=None) -> dict:
         box = list(box) if isinstance(box, list) else []
         box.extend(would)
         ctx.storage.set(OUTBOX_KEY, box[-200:])
-    log.info("dry-run: recorded %s email(s), sent 0", len(would))
+    log.info(f"dry-run: recorded {len(would)} email(s), sent 0")
     return {"queued": [], "sent": [], "skipped": skipped, "would_send": would, "dry_run": True}
 # ---------- payments (seller). Offered only when LEADPACK_PRICE is set. ----------
 
@@ -1857,7 +1860,7 @@ async def _safe_send(ctx: Context, to: str, msg) -> None:
     try:
         await ctx.send(to, msg)
     except Exception as err:  # noqa: BLE001
-        ctx.logger.warning("payment send failed: %s", redact(err))
+        ctx.logger.warning(f"payment send failed: {redact(err)}")
 
 
 def _pay_audit(ctx: Context, sender: str, action: str, detail: str = "") -> None:
@@ -1866,7 +1869,7 @@ def _pay_audit(ctx: Context, sender: str, action: str, detail: str = "") -> None
         audit(camp, "payment", action, "system", detail)
         save(ctx, sender, camp)
     except Exception as err:  # noqa: BLE001
-        ctx.logger.warning("payment audit failed: %s", redact(err))
+        ctx.logger.warning(f"payment audit failed: {redact(err)}")
 
 
 async def offer(ctx: Context, sender: str, camp: dict) -> None:
@@ -1894,7 +1897,7 @@ async def offer(ctx: Context, sender: str, camp: dict) -> None:
             "Verification is a **DEMO, dry run** check. This is optional: your campaign and approvals carry on."))
         await ctx.send(sender, req)
     except Exception as err:  # noqa: BLE001
-        ctx.logger.warning("payment offer failed: %s", redact(err))
+        ctx.logger.warning(f"payment offer failed: {redact(err)}")
         await _safe_send(ctx, sender, chat_text(
             f"I couldn't create the payment request ({redact(err)}). The free campaign is unaffected."))
 
@@ -1924,14 +1927,14 @@ async def on_commit(ctx: Context, sender: str, msg: CommitPayment):
         pending = ctx.storage.get(_pending_key(sender))
         reason = check_commit(msg, pending if isinstance(pending, dict) else None)
         if reason:
-            ctx.logger.info("payment %s cancelled (DEMO, dry run): %s", msg.transaction_id, reason)
+            ctx.logger.info(f"payment {msg.transaction_id} cancelled (DEMO, dry run): {reason}")
             _pay_audit(ctx, sender, "cancelled", f"{msg.transaction_id}: {reason}")
             await _safe_send(ctx, sender, CancelPayment(transaction_id=msg.transaction_id, reason=reason))
             await _safe_send(ctx, sender, chat_text(
                 f"Payment not accepted: {reason}. Nothing was charged by me; your campaign is unaffected."))
             return
         ctx.storage.remove(_pending_key(sender))
-        ctx.logger.info("payment %s verified (DEMO, dry run - not checked on-chain)", msg.transaction_id)
+        ctx.logger.info(f"payment {msg.transaction_id} verified (DEMO, dry run - not checked on-chain)")
         _pay_audit(ctx, sender, "completed (DEMO, dry run)",
                    f"{msg.transaction_id} {msg.funds.amount} {msg.funds.currency}")
         await _safe_send(ctx, sender, CompletePayment(transaction_id=msg.transaction_id))
@@ -1949,7 +1952,7 @@ async def on_commit(ctx: Context, sender: str, msg: CommitPayment):
 async def on_reject(ctx: Context, sender: str, msg: RejectPayment):
     try:
         ctx.storage.remove(_pending_key(sender))
-        ctx.logger.info("payment rejected: %s", msg.reason)
+        ctx.logger.info(f"payment rejected: {msg.reason}")
         _pay_audit(ctx, sender, "rejected", msg.reason or "")
         await _safe_send(ctx, sender, chat_text("No problem, no lead pack. Your free campaign carries on as normal."))
     except Exception:  # noqa: BLE001
@@ -2038,14 +2041,14 @@ async def _remote(ctx: Context, tool: str, args: dict, address: str):
             reply, status = None, f"send error {redact(err)[:200]}"
         took = time.monotonic() - start
         if isinstance(reply, ToolResponse):
-            ctx.logger.info("%s %s response after %.1fs (%s, ok=%s)", tool, rid[:8], took, attempt, reply.ok)
+            ctx.logger.info(f"{tool} {rid[:8]} response after {took:.1f}s ({attempt}, ok={reply.ok})")
             if not reply.ok:
                 return None, reply.error or "unknown error", False
             try:
                 return json.loads(reply.result or "{}"), "", False
             except ValueError:
                 return None, f"the {tool} agent returned invalid JSON", False
-        ctx.logger.warning("%s %s no response after %.1fs (%s, status %s)", tool, rid[:8], took, attempt, status)
+        ctx.logger.warning(f"{tool} {rid[:8]} no response after {took:.1f}s ({attempt}, status {status})")
     return None, "timeout", True
 
 
@@ -2057,9 +2060,9 @@ async def call_tool(ctx: Context, tool: str, args: dict) -> tuple[dict | None, s
         result, error, timed_out = await _remote(ctx, tool, args, address)
         if not timed_out:
             return result, error
-        ctx.logger.warning("fallback: inline %s (remote timed out)", tool)
+        ctx.logger.warning(f"fallback: inline {tool} (remote timed out)")
     else:
-        ctx.logger.info("fallback: inline %s (no %s)", tool, env_name)
+        ctx.logger.info(f"fallback: inline {tool} (no {env_name})")
     limit = inline_budget(tool) + 5
     try:
         raw = await asyncio.wait_for(INLINE[tool](json.loads(json.dumps(args)), ctx), limit)
@@ -2067,7 +2070,7 @@ async def call_tool(ctx: Context, tool: str, args: dict) -> tuple[dict | None, s
     except Exception as err:  # noqa: BLE001
         why = f"timed out after {limit:g}s" if isinstance(err, asyncio.TimeoutError) else redact(
             f"{type(err).__name__}: {err}")[:200]
-        ctx.logger.error("fallback: inline %s failed: %s", tool, why)
+        ctx.logger.error(f"fallback: inline {tool} failed: {why}")
         return None, f"{name} timed out (inline run: {why})" if isinstance(err, asyncio.TimeoutError) else why
 
 
@@ -2188,7 +2191,7 @@ def next_gate(gate: str) -> str | None:
 def log_draft_skips(ctx: Context, result: dict) -> None:
     for item in result.get("skipped") or []:
         detail = f": {redact(item['detail'])}" if item.get("detail") else ""
-        ctx.logger.warning("no draft for %s (%s)%s", item.get("lead_id"), item.get("reason"), detail)
+        ctx.logger.warning(f"no draft for {item.get('lead_id')} ({item.get('reason')}){detail}")
 
 
 async def build_icp_step(ctx: Context, sender: str, camp: dict) -> None:
@@ -2585,7 +2588,7 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
     text = text_of(msg)
     if not text:
         return
-    ctx.logger.info("user %s...: %s", sender[:16], text[:200])
+    ctx.logger.info(f"user {sender[:16]}...: {text[:200]}")
     camp = load(ctx, sender)
     try:
         fast = fast_command(text, camp)
@@ -2596,7 +2599,7 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
             cmd = await parse_intent(text, camp["state"], pending_gate(camp), camp.get("last_list_names") or [])
         else:
             cmd = fast
-        ctx.logger.info("intent: %s", cmd.get("intent"))
+        ctx.logger.info(f"intent: {cmd.get('intent')}")
         camp = await dispatch(ctx, sender, camp, cmd)
     except Exception:  # noqa: BLE001
         ctx.logger.exception("handler failed")
@@ -2618,7 +2621,7 @@ agent.include(pay_proto, publish_manifest=True)
 @agent.on_event("startup")
 async def show_address(ctx: Context):
     addr = getattr(getattr(ctx, "agent", None), "address", None) or getattr(agent, "address", "")
-    ctx.logger.info("Harvest Agent address: %s", addr)
+    ctx.logger.info(f"Harvest Agent address: {addr}")
     missing = [env for env, _ in SPECIALISTS.values() if not os.getenv(env, "").strip()]
     if missing:
-        ctx.logger.info("Specialist addresses unset (%s); those steps run in-process.", ", ".join(missing))
+        ctx.logger.info(f"Specialist addresses unset ({', '.join(missing)}); those steps run in-process.")
