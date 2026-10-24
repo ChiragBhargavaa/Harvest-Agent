@@ -251,11 +251,14 @@ Send **≤15 leads per request**.
 // result
 {"leads": [Lead], "call_list": [Lead], "source_notes": ["OpenStreetMap: 86 businesses ...; 8 list a website."], "city": "Jaipur, ..."}
 ```
-**`find_contacts`** (M2)
+**`find_contacts`** ✅ implemented (M2)
 ```jsonc
 {"leads": [Lead], "max_pages_per_site": 5}
-→ {"contacts": [Contact], "skipped": [{"lead_id": "...", "reason": "robots_disallowed|no_website|unreachable|no_email_found"}]}
+→ {"contacts": [Contact], "skipped": [{"lead_id": "...", "reason": "no_website|banned_host|robots_disallowed|unreachable|no_email_found|mx_failed"}]}
 ```
+A lead appears in `skipped` only if it ends up with no contact. Contacts are deduped per lead (best confidence wins) and
+sorted per lead: confidence, then primary-contact role. `phones` = all phones seen on the site plus the OSM phone tag.
+Leads are crawled concurrently (≤5 at a time, one shared `PoliteFetcher`); MX lookups run in a thread, once per domain.
 **`qualify_leads`** (M3)
 ```jsonc
 {"icp": ICP, "leads": [Lead], "contacts": [Contact]}  →  {"reviews": [Review]}
@@ -300,7 +303,10 @@ Send **≤15 leads per request**.
 ```
 **Contact confidence:** `high` = owner/manager/sales-type address on the business's own domain, published on its own site;
 `medium` = generic address (info@, hello@) on its own domain, or a free-mail address published on its own site;
-`low` = found only on a third-party page. **Primary contact:** owner/manager > sales/orders > info/hello.
+`low` = found only on a third-party page (this includes OSM `email` tags, `source: "osm"`, `source_url` = the OSM object), or an
+address on another, non-free-mail domain that appears on the business's site (e.g. its web designer's).
+Emails failing `crawl.mx_ok` are dropped. Roles from `crawl.guess_role` map founder→owner, booking→orders, hello→info, support→contact.
+**Primary contact:** owner/manager > sales/orders > info/hello.
 
 ### 3.9 Orchestrator state (one campaign per user) — `agents/state.py`
 **Storage key:** `f"user:{sender}"`, or `user:owner` with `OWNER_MODE=true`. ⚠️ Confirm `sender` is stable across one ASI:One chat.
@@ -424,7 +430,7 @@ agents/
   geo.py             Nominatim + Overpass
   orchestrator.py    chat protocol, intent, state machine, gates          ✅ M0
   lead_finder.py     find_leads                                           ✅ M1 logic
-  contact_finder.py  find_contacts (shell → M2)
+  contact_finder.py  find_contacts                                        ✅ M2 logic
   lead_analyst.py    qualify_leads (site_signals done; LLM scoring → M3)
   copywriter.py      draft_emails (shell → M4)
   sender.py          send_emails (shell → M6, stretch)
@@ -439,8 +445,8 @@ Shared modules are fine for mailbox agents run from this repo. If an agent moves
 helpers into one file (§4.7).
 
 ### 3.18 Milestones and acceptance tests
-**Mock test** ✅ (`agents/mock_test.py`, 20 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*` and the
-fetcher are monkeypatched; all agents + a scripted user run in a `Bureau(port=8010)`; exit code 0 = pass.
+**Mock test** ✅ (`agents/mock_test.py`, 36 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
+fetcher and `mx_ok` are monkeypatched; all agents + a scripted user run in a `Bureau(port=8010)`; exit code 0 = pass.
 
 | Milestone | Done when |
 |---|---|
@@ -674,8 +680,9 @@ agent.include(pay_proto, publish_manifest=True)
 ## 5. Repo state (24 Oct 2026)
 - **M0 done:** all files in §3.17 exist; the 6 agents boot; `agents/mock_test.py` passes (20 checks) ✅.
 - **Implemented:** orchestrator (intent, gates, cards, pause/resume, settings, retry/skip, audit log), `find_leads`
-  (OSM + web search + verification), crawler, geo, all LLM prompts, `site_signals`.
-- **Shells (return `ok=False, "not implemented yet"`):** `find_contacts` (M2), `qualify_leads` (M3), `draft_emails` (M4), `send_emails` (M6).
+  (OSM + web search + verification), `find_contacts` (polite crawl + extraction + MX, mock-tested only), crawler, geo,
+  all LLM prompts, `site_signals`.
+- **Shells (return `ok=False, "not implemented yet"`):** `qualify_leads` (M3), `draft_emails` (M4), `send_emails` (M6).
 - **Not yet done by Chirag:** `ASI1_API_KEY` in `.env`, run `setup.sh`, `scripts/probe_sources.py`, mailbox connection, Agentverse profiles.
 - The earlier generic starter (`specialist.py`/`page_check`) was folded into `common.make_specialist` and `lead_analyst.site_signals`.
 
