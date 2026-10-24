@@ -1054,7 +1054,7 @@ class FakePayCtx:
                                       "set": lambda s, k, v: self.data.__setitem__(k, v),
                                       "remove": lambda s, k: self.data.pop(k, None)})()
         self.logger = logging.getLogger("mock-payments")
-        self.agent = type("A", (), {"address": orchestrator.agent.address})()
+        self.agent = type("A", (), {"address": orchestrator.agent.address, "wallet": orchestrator.agent.wallet})()
 
     async def send(self, to, msg):
         if self.fail_send:
@@ -1078,6 +1078,16 @@ async def payment_tests():
     import payments
 
     buyer = "agent1qbuyer"
+    wallet = str(orchestrator.agent.wallet.address())
+    rctx = FakePayCtx()
+    check(wallet.startswith("fetch1") and payments.recipient(rctx) == wallet,
+          "payments: LEADPACK_RECIPIENT unset -> recipient is the orchestrator's Fetch wallet address (fetch1…)")
+    os.environ["LEADPACK_RECIPIENT"] = "  fetch1override  "
+    try:
+        check(payments.recipient(rctx) == "fetch1override", "payments: LEADPACK_RECIPIENT set -> it wins (stripped)")
+    finally:
+        os.environ.pop("LEADPACK_RECIPIENT", None)
+
     check(orchestrator.FAST_INTENTS.get("buy lead pack") == "buy_lead_pack"
           and payments.pay_proto.digest in orchestrator.agent.protocols,
           "payments: orchestrator includes the seller Payment Protocol and the 'buy lead pack' intent")
@@ -1097,9 +1107,9 @@ async def payment_tests():
     await payments.offer(ctx, buyer, pack_camp)
     req = (ctx.of(RequestPayment) or [None])[0]
     check(req is not None and req.accepted_funds[0].amount == "0.1" and req.accepted_funds[0].currency == "FET"
-          and req.recipient == orchestrator.agent.address and req.reference.startswith("leadpack-c_test-")
+          and req.recipient == str(orchestrator.agent.wallet.address()) and req.reference.startswith("leadpack-c_test-")
           and pack_camp["log"][-1]["action"] == "requested" and pack_camp["state"] == st.IDLE,
-          "payments: 'buy lead pack' sends RequestPayment (0.1 FET to the agent), logged, campaign state untouched")
+          "payments: 'buy lead pack' sends RequestPayment (0.1 FET to the agent wallet), logged, campaign state untouched")
 
     def commit(**kw) -> CommitPayment:
         args = {"funds": Funds(amount="0.1", currency="FET"), "recipient": req.recipient,
@@ -1150,9 +1160,14 @@ async def payment_tests():
         check(False, f"payments: handler raised {err!r}")
 
 
+_saved_recipient = os.environ.pop("LEADPACK_RECIPIENT", None)  # the payment checks expect the default recipient
 _pay_loop = asyncio.new_event_loop()  # a private loop: the Bureau's loop is left untouched
-_pay_loop.run_until_complete(payment_tests())
-_pay_loop.close()
+try:
+    _pay_loop.run_until_complete(payment_tests())
+finally:
+    _pay_loop.close()
+    if _saved_recipient is not None:
+        os.environ["LEADPACK_RECIPIENT"] = _saved_recipient
 
 if __name__ == "__main__":
     threading.Timer(150, lambda: (print("TIMEOUT", flush=True), os._exit(2))).start()

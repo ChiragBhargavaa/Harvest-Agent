@@ -677,13 +677,13 @@ So try `json.loads` first, then fall back to the LLM intent parser. If validatio
 - **LeadReach status ✅ (mock test):** `agents/payments.py` builds `Protocol(spec=payment_protocol_spec, role="seller")`, and
   the orchestrator includes it with `publish_manifest=True`. In chat, **buy lead pack** / **unlock full list** sends a `RequestPayment` for a
   "verified lead pack" (`LEADPACK_PRICE` default `0.1`, `LEADPACK_CURRENCY` default `FET`, `LEADPACK_PAYMENT_METHOD` default
-  `fet_direct`, recipient `LEADPACK_RECIPIENT` or the agent address, 10-minute deadline). Nothing is offered until the campaign has contacts.
+  `fet_direct`, recipient `LEADPACK_RECIPIENT` or the orchestrator's Fetch wallet address (fetch1…), 10-minute deadline). Nothing is offered until the campaign has contacts.
   `CommitPayment` is checked against the open request (transaction id, reference, currency, amount ≥ price, recipient). That
   check is a **DEMO verification**, labelled as such in the logs and the reply; there is no on-chain or Stripe check yet. Valid →
   `CompletePayment` plus the pack (each verified contact with its source URL). Invalid, or no open request → `CancelPayment`.
   `RejectPayment` → a friendly reply. Each event goes to the audit log (step `payment`). The handlers never raise and never change the
   campaign state, so the free flow and the approval gates don't depend on payment.
-- **Open questions:** ⚠️ what `recipient` should hold (agent vs wallet address), and how ASI:One renders non-Stripe methods. Both are undocumented; test before demoing.
+- **Open questions:** ⚠️ `recipient` now defaults to the orchestrator wallet (fetch1…), our best reading of `fet_direct`; still unverified on ASI:One. Also unknown: how ASI:One renders non-Stripe methods. Both are undocumented; test before demoing.
 ```python
 from uagents import Protocol
 from uagents_core.contrib.protocols.payment import (

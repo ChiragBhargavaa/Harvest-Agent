@@ -9,7 +9,7 @@ are untouched. On-chain verification is not implemented, so every verification i
 The pack only contains data the campaign already verified (crawled/OSM emails with their source URLs).
 
 Env: LEADPACK_PRICE (default "0.1"), LEADPACK_CURRENCY ("FET"), LEADPACK_PAYMENT_METHOD ("fet_direct"),
-     LEADPACK_RECIPIENT (wallet address; default the agent address).
+     LEADPACK_RECIPIENT (wallet address; default the agent's Fetch wallet address (fetch1…)).
 """
 
 import os
@@ -43,7 +43,7 @@ def price() -> tuple[str, str, str]:
 
 
 def recipient(ctx: Context) -> str:
-    return os.getenv("LEADPACK_RECIPIENT", "").strip() or ctx.agent.address
+    return os.getenv("LEADPACK_RECIPIENT", "").strip() or str(ctx.agent.wallet.address())
 
 
 def verification_mode() -> str:
