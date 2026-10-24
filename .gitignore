@@ -1,0 +1,63 @@
+# --- Secrets (never commit) ---
+.env
+.env.*
+!.env.example
+*.pem
+*credentials*.json
+*service-account*.json
+client_secret*.json
+private_keys.json
+token.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# --- Virtual envs / tooling caches ---
+.venv/
+venv/
+env/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# --- uAgents runtime storage (holds campaign state + contacts) ---
+*_data.json
+agent1q*_data.json
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# --- Logs / scratch ---
+*.log
+logs/
+scratch/
+*.tmp
+*.temp
+*.bak
+
+# --- Editors / OS ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# --- Claude Code (keep shared skills, ignore personal settings) ---
+.claude/settings.local.json
+
+# --- Node (npx fetch-skills may create these) ---
+node_modules/
+
+# --- Local config overrides ---
+config/*.local.yaml
