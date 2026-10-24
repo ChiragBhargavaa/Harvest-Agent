@@ -18,16 +18,16 @@
 
 ## Agents
 
-Addresses are fixed by the seeds in `.env` (keep that file; `bash setup.sh` prints them). Profile URLs are added after the mailbox is connected.
+Addresses are fixed by the seeds in `.env` (keep that file; `bash setup.sh` prints them). Each agent is connected via mailbox and listed on Agentverse.
 
 | Agent | Name | Role | Status | Address | Agentverse profile |
 |---|---|---|---|---|---|
-| Orchestrator | `leadreach` | Talks to the brand in ASI:One (Chat Protocol + Interactive Cards), builds the ideal-customer profile, runs the approval gates, edits drafts, audit log | ✅ implemented | `agent1q0nlrk0hsqgn9l85z8thxmr5tltjqxeqsmjw4zzme389dcw7zkudjq3lk23` | `<paste>` |
-| Lead Finder | `leadreach-finder` | Finds local businesses: OpenStreetMap + ASI:One web search, verifies websites by crawling | ✅ implemented | `agent1q06nvrv65ewr9g62te9xrhqgc7hu8kc3823rrvtttu33nsk4krek2w4cz0d` | `<paste>` |
-| Contact Finder | `leadreach-contacts` | Published emails/phones by polite crawling + MX check, confidence + source URL per contact | ✅ implemented | `agent1qdr009c63xpzznwt07k62vxg5fzpr3kf89s65ckz0rjda2ls3s4evf2v4c8` | `<paste>` |
-| Lead Analyst | `leadreach-analyst` | Fit score + evidence-backed hooks from each website (signals-only fallback) | ✅ implemented | `agent1qd8k32878hmz7jc4cw0cr6mv9q6eqa24xrac6cqxeg0c0kdjf4guj05wpl9` | `<paste>` |
-| Copywriter | `leadreach-writer` | Short personal drafts (ASI:One) + deterministic validator | ✅ implemented | `agent1q2ttlc7yh8dwy4vj8knr6jhmguy9pcp0a8zawtwnf3up26zgdq6qsaech9t` | `<paste>` |
-| Sender (stretch) | `leadreach-sender` | Placeholder: runs and answers, but `send_emails` replies "not implemented yet"; nothing is ever sent | ⏸ not part of this demo (DRY_RUN only) | `agent1q007hz3k52l3pjuwxxfrn28a6xv768alq5jygldx3x7ae6had0d47gtw337` | `<paste>` |
+| Orchestrator | `leadreach` | Talks to the brand in ASI:One (Chat Protocol + Interactive Cards), builds the ideal-customer profile, runs the approval gates, edits drafts, audit log | ✅ implemented | `agent1q0nlrk0hsqgn9l85z8thxmr5tltjqxeqsmjw4zzme389dcw7zkudjq3lk23` | [profile](https://agentverse.ai/agents/details/agent1q0nlrk0hsqgn9l85z8thxmr5tltjqxeqsmjw4zzme389dcw7zkudjq3lk23/profile) |
+| Lead Finder | `leadreach-finder` | Finds local businesses: OpenStreetMap + ASI:One web search, verifies websites by crawling | ✅ implemented | `agent1q06nvrv65ewr9g62te9xrhqgc7hu8kc3823rrvtttu33nsk4krek2w4cz0d` | [profile](https://agentverse.ai/agents/details/agent1q06nvrv65ewr9g62te9xrhqgc7hu8kc3823rrvtttu33nsk4krek2w4cz0d/profile) |
+| Contact Finder | `leadreach-contacts` | Published emails/phones by polite crawling + MX check, confidence + source URL per contact | ✅ implemented | `agent1qdr009c63xpzznwt07k62vxg5fzpr3kf89s65ckz0rjda2ls3s4evf2v4c8` | [profile](https://agentverse.ai/agents/details/agent1qdr009c63xpzznwt07k62vxg5fzpr3kf89s65ckz0rjda2ls3s4evf2v4c8/profile) |
+| Lead Analyst | `leadreach-analyst` | Fit score + evidence-backed hooks from each website (signals-only fallback) | ✅ implemented | `agent1qd8k32878hmz7jc4cw0cr6mv9q6eqa24xrac6cqxeg0c0kdjf4guj05wpl9` | [profile](https://agentverse.ai/agents/details/agent1qd8k32878hmz7jc4cw0cr6mv9q6eqa24xrac6cqxeg0c0kdjf4guj05wpl9/profile) |
+| Copywriter | `leadreach-writer` | Short personal drafts (ASI:One) + deterministic validator | ✅ implemented | `agent1q2ttlc7yh8dwy4vj8knr6jhmguy9pcp0a8zawtwnf3up26zgdq6qsaech9t` | [profile](https://agentverse.ai/agents/details/agent1q2ttlc7yh8dwy4vj8knr6jhmguy9pcp0a8zawtwnf3up26zgdq6qsaech9t/profile) |
+| Sender (stretch) | `leadreach-sender` | Placeholder: runs and answers, but `send_emails` replies "not implemented yet"; nothing is ever sent | ⏸ not part of this demo (DRY_RUN only) | `agent1q007hz3k52l3pjuwxxfrn28a6xv768alq5jygldx3x7ae6had0d47gtw337` | [profile](https://agentverse.ai/agents/details/agent1q007hz3k52l3pjuwxxfrn28a6xv768alq5jygldx3x7ae6had0d47gtw337/profile) |
 
 The demo workflow ends at approved drafts. At the send checkpoint the orchestrator reports that sending isn't available and
 offers **skip** to finish the campaign. Sending (M6) and the M5 extras (`add lead`, `import list`, reply classification) are
