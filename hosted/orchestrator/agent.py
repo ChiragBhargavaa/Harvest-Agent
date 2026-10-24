@@ -1,9 +1,11 @@
 """Harvest Agent — Agentverse hosted orchestrator (paste this whole file into Build).
 
 The hosted runtime pre-creates `agent`. Do not build another agent object and do not start a run loop.
-Specialist steps run on LEAD_*_AGENT_ADDRESS when that secret is set; otherwise (or on timeout)
-they run in-process. There is no repo import and no module-level mutable cache: durable state
-is ctx.storage. DRY_RUN sending is hard-coded on. Secrets come only from os.getenv.
+Specialist steps run on LEAD_*_AGENT_ADDRESS when that secret is set; otherwise, on timeout,
+or on a remote error, they run in-process. There is no repo import and no module-level durable
+cache: campaigns live in ctx.storage. DRY_RUN sending is hard-coded on. Secrets come only from os.getenv.
+The chat handler returns after a short ack. Hosted invocations end when that handler returns
+(globals reset after each call), so the long step continues as a StepJob to this agent.
 """
 
 import asyncio
@@ -278,6 +280,9 @@ DEFAULT_CAMPAIGN = {
     "style_rules": [],
     "pending_style_rule": None,
     "draft_skipped": [],
+    "contact_skipped": [],
+    "step_actors": [],
+    "acked_gate": None,
     "log": [],
 }
 
@@ -302,6 +307,8 @@ def load(ctx: Context, sender: str) -> dict:
         camp["settings"] = copy.deepcopy(DEFAULT_CAMPAIGN["settings"])
     camp["settings"]["dry_run"] = True
     camp.setdefault("log", [])
+    camp.setdefault("step_actors", [])
+    camp.setdefault("contact_skipped", [])
     return camp
 
 
@@ -488,6 +495,8 @@ def status_card(camp: dict) -> ChatMessage:
         {"label": "Approvals on", "value": ", ".join(g for g, v in s["ask_before"].items() if v) or "none"},
         {"label": "Daily cap · dry run", "value": f"{s['daily_cap']} · {'on' if s['dry_run'] else 'off'}"},
     ]
+    for label, actor in steps_report(camp):
+        rows.append({"label": label, "value": actor})
     for entry in (camp.get("log") or [])[-5:]:
         rows.append({"label": f"{entry['ts'][11:16]} {entry['step']}", "value": f"{entry['action']} ({entry['actor']})"})
     return detail_card("Campaign status", rows, [], "**Campaign status**\n" + _numbered(rows), terminal=True)
@@ -863,10 +872,157 @@ def extract_emails(page: Page) -> list[str]:
     return sorted(set(clean))
 
 
+def _norm_phone(raw: str) -> str | None:
+    text = re.sub(r"[\s().-]", "", str(raw or ""))
+    digits = re.sub(r"\D", "", text)
+    if text.startswith("+"):
+        text = "+" + digits
+    else:
+        text = digits
+    if not 10 <= len(digits) <= 15:
+        return None
+    return text
+
+
+def _phones_from(*values) -> list[str]:
+    found: list[str] = []
+    for value in values:
+        parts = value if isinstance(value, (list, tuple, set)) else str(value or "").split(";")
+        for part in parts:
+            phone = _norm_phone(str(part))
+            if phone and phone not in found:
+                found.append(phone)
+    return found
+
+
+def _schema_telephones(html: str) -> list[str]:
+    found: list[str] = []
+    for blob in re.findall(
+            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html or "", re.I | re.S):
+        try:
+            data = json.loads(blob)
+        except ValueError:
+            continue
+        stack = [data]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                tel = node.get("telephone")
+                if isinstance(tel, str):
+                    found.append(tel)
+                elif isinstance(tel, list):
+                    found.extend(str(item) for item in tel if isinstance(item, (str, int)))
+                stack.extend(node.values())
+            elif isinstance(node, list):
+                stack.extend(node)
+    found.extend(re.findall(r'itemprop=["\']telephone["\'][^>]*content=["\']([^"\']+)', html or "", re.I))
+    found.extend(re.findall(r'itemprop=["\']telephone["\'][^>]*>([^<]+)', html or "", re.I))
+    return found
+
+
 def extract_phones(page: Page) -> list[str]:
-    phones = {link[4:] for link in page.links if link.lower().startswith("tel:")}
-    phones.update(match.strip() for match in PHONE_RE.findall(page.text))
-    return sorted({re.sub(r"[\s-]", "", phone) for phone in phones if len(re.sub(r"\D", "", phone)) >= 10})
+    phones = [link[4:] for link in page.links if link.lower().startswith("tel:")]
+    phones.extend(PHONE_RE.findall(page.text))
+    phones.extend(_schema_telephones(page.html))
+    return _phones_from(phones)
+
+
+_SOCIAL_HOSTS = {
+    "instagram": ("instagram.com",),
+    "facebook": ("facebook.com", "fb.com", "m.facebook.com"),
+}
+_SOCIAL_SKIP = {
+    "instagram": {"explore", "about", "accounts", "p", "reel", "reels", "stories", "direct"},
+    "facebook": {"sharer", "share", "dialog", "plugins", "login", "watch", "marketplace", "events", "sharer.php"},
+}
+
+
+def _social_link(url: str, kind: str) -> str | None:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    if not any(host == item or host.endswith("." + item) for item in _SOCIAL_HOSTS[kind]):
+        return None
+    parts = [part for part in parsed.path.split("/") if part]
+    if not parts or parts[0].lower() in _SOCIAL_SKIP[kind]:
+        return None
+    return f"https://{host}/{parts[0]}"
+
+
+def _published_social(value, kind: str) -> str | None:
+    """A social value that was actually published. Handles stay handles; URLs stay profile URLs."""
+    raw = str(value or "").strip()
+    if not raw or any(ch.isspace() for ch in raw) or len(raw) > 200:
+        return None
+    if raw.lower().startswith(("http://", "https://")):
+        return _social_link(raw, kind)
+    handle = raw.lstrip("@").strip("/")
+    if not re.fullmatch(r"[A-Za-z0-9._]{2,30}", handle):
+        return None
+    return handle
+
+
+def _page_social(page: Page) -> dict:
+    found = {}
+    for link in page.links:
+        for kind in ("instagram", "facebook"):
+            if kind not in found and (url := _social_link(link, kind)):
+                found[kind] = url
+    return found
+
+
+def _business_channels(lead: dict, pages: list) -> dict:
+    """Phone, website, Instagram and Facebook published on the lead or its pages. Nothing is guessed."""
+    phones = _phones_from(lead.get("phone"), lead.get("phones"))
+    instagram = _published_social(lead.get("instagram") or lead.get("contact:instagram"), "instagram")
+    facebook = _published_social(lead.get("facebook") or lead.get("contact:facebook"), "facebook")
+    for page in pages or []:
+        phones = _phones_from(phones, extract_phones(page))
+        social = _page_social(page)
+        instagram = social.get("instagram") or instagram
+        facebook = social.get("facebook") or facebook
+    channels = {"phones": phones, "website": normalise_url(lead.get("website"))}
+    if instagram:
+        channels["instagram"] = instagram
+    if facebook:
+        channels["facebook"] = facebook
+    return channels
+
+
+def _with_channels(record: dict, channels: dict) -> dict:
+    merged = dict(record)
+    merged["phones"] = list(channels.get("phones") or [])
+    for key in ("website", "instagram", "facebook"):
+        if channels.get(key):
+            merged[key] = channels[key]
+    return merged
+
+
+def _attach_channels(signals: dict, lead: dict, contact: dict | None) -> dict:
+    """Published contact channels for the analyst and writer. Missing values stay missing."""
+    signals = dict(signals or {})
+    contact = contact or {}
+    phones = list(contact.get("phones") or []) or _phones_from(lead.get("phone"))
+    if phones and (contact.get("phones") or not signals.get("phones")):
+        signals["phones"] = phones
+    if contact.get("website"):
+        signals["website"] = contact["website"]
+    elif not signals.get("website") and normalise_url(lead.get("website")):
+        signals["website"] = normalise_url(lead.get("website"))
+    for key in ("instagram", "facebook"):
+        if contact.get(key):
+            signals[key] = contact[key]
+        elif not signals.get(key):
+            value = _published_social(lead.get(key), key)
+            if value:
+                signals[key] = value
+    return signals
+
+
+def _lead_for_writer(lead: dict, contact: dict | None) -> dict:
+    merged = _attach_channels(lead, lead, contact)
+    if contact and contact.get("email"):
+        merged["email"] = contact["email"]
+    return merged
 
 
 def guess_role(email: str) -> str:
@@ -985,6 +1141,8 @@ def _to_lead(el: dict) -> dict | None:
         "website": tags.get("website") or tags.get("contact:website"),
         "osm_emails": [e.strip() for e in (tags.get("email") or tags.get("contact:email") or "").split(";") if e.strip()],
         "phone": tags.get("phone") or tags.get("contact:phone"),
+        "instagram": tags.get("contact:instagram"),
+        "facebook": tags.get("contact:facebook"),
         "source": "osm",
         "source_ref": f"https://www.openstreetmap.org/{el['type']}/{el['id']}",
     }
@@ -1342,7 +1500,7 @@ async def _crawl_contact(fetcher, url: str, max_pages: int):
 async def _contacts_for(lead: dict, fetcher, sem: asyncio.Semaphore, mx_cache: dict, max_pages: int):
     website = normalise_url(lead.get("website"))
     found: list[tuple[str, str, bool]] = []
-    phones: set[str] = set()
+    pages: list = []
     own: set[str] = set()
     reason = None
     if not website:
@@ -1358,13 +1516,13 @@ async def _contacts_for(lead: dict, fetcher, sem: asyncio.Semaphore, mx_cache: d
         for page in pages:
             on_own = _same_site(domain_of(page.url), own)
             found += [(email, page.url, on_own) for email in extract_emails(page)]
-            phones.update(extract_phones(page))
-    phones.update(re.sub(r"[\s-]", "", phone) for phone in (lead.get("phone") or "").split(";") if phone.strip())
+    channels = _business_channels(lead, pages)
     best: dict[str, dict] = {}
     for email, url, on_own in found:
         role, confidence = classify(email, on_own, own)
-        contact = {"lead_id": lead["id"], "email": email, "role": role, "person_name": None, "source": "website",
-                   "source_url": url, "confidence": confidence, "mx_ok": True}
+        contact = _with_channels(
+            {"lead_id": lead["id"], "email": email, "role": role, "person_name": None, "source": "website",
+             "source_url": url, "confidence": confidence, "mx_ok": True}, channels)
         prev = best.get(email)
         if prev is None or CONFIDENCE_RANK[confidence] < CONFIDENCE_RANK[prev["confidence"]]:
             best[email] = contact
@@ -1372,11 +1530,12 @@ async def _contacts_for(lead: dict, fetcher, sem: asyncio.Semaphore, mx_cache: d
         email = _clean_email(raw)
         if email and email not in best:
             role = guess_role(email)
-            best[email] = {"lead_id": lead["id"], "email": email, "role": ROLE_MAP.get(role, role),
-                           "person_name": None, "source": "osm", "source_url": lead.get("source_ref"),
-                           "confidence": "low", "mx_ok": True}
+            best[email] = _with_channels(
+                {"lead_id": lead["id"], "email": email, "role": ROLE_MAP.get(role, role),
+                 "person_name": None, "source": "osm", "source_url": lead.get("source_ref"),
+                 "confidence": "low", "mx_ok": True}, channels)
     if not best:
-        return [], reason or "no_email_found"
+        return [], reason or "no_email_found", channels
     for domain in {email.split("@")[1] for email in best}:
         if domain not in mx_cache:
             mx_cache[domain] = asyncio.ensure_future(asyncio.to_thread(mx_ok, domain))
@@ -1391,11 +1550,11 @@ async def _contacts_for(lead: dict, fetcher, sem: asyncio.Semaphore, mx_cache: d
         except Exception:  # noqa: BLE001
             ok = False
         if ok is not False:
-            contacts.append(dict(contact, phones=sorted(phones)))
+            contacts.append(contact)
     if not contacts:
-        return [], "mx_failed"
+        return [], "mx_failed", channels
     contacts.sort(key=lambda c: (CONFIDENCE_RANK[c["confidence"]], ROLE_RANK.get(c["role"], 3), c["email"]))
-    return contacts, None
+    return contacts, None, channels
 
 
 async def find_contacts(args: dict, ctx=None) -> dict:
@@ -1413,19 +1572,28 @@ async def find_contacts(args: dict, ctx=None) -> dict:
             try:
                 return await _contacts_for(lead, fetcher, sem, mx_cache, max_pages)
             except Exception:  # noqa: BLE001
-                return [], "unreachable"
+                return [], "unreachable", _business_channels(lead, [])
 
         tasks = [asyncio.create_task(one(lead)) for lead in leads]
         _, pending = await asyncio.wait(tasks, timeout=contact_budget())
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
-    results = [([], "timed_out") if task in pending else task.result() for task in tasks]
+    results = [([], "timed_out", _business_channels(lead, [])) if task in pending else task.result()
+               for lead, task in zip(leads, tasks, strict=True)]
     contacts, skipped = [], []
-    for lead, (found, reason) in zip(leads, results, strict=True):
+    for lead, (found, reason, channels) in zip(leads, results, strict=True):
         contacts += found
         if reason and not found:
-            skipped.append({"lead_id": lead["id"], "reason": reason})
+            row = {"lead_id": lead["id"], "reason": reason}
+            alt = channels.get("phones") or channels.get("instagram") or channels.get("facebook")
+            if reason != "mx_failed" and alt:
+                row["note"] = "no email: phone/IG available"
+                row["phones"] = list(channels.get("phones") or [])
+                for key in ("website", "instagram", "facebook"):
+                    if channels.get(key):
+                        row[key] = channels[key]
+            skipped.append(row)
     log.info(f"find_contacts done in {time.monotonic() - start:.1f}s: "
              f"{len(contacts)} contacts, {len(skipped)} skipped")
     return {"contacts": contacts, "skipped": skipped}
@@ -1592,7 +1760,7 @@ async def _llm_review(icp: dict, lead: dict, signals: dict, pages: list) -> dict
     return {"fit_score": score, "hooks": hooks, "summary": _words(data.get("summary"), 40)}
 
 
-async def review_lead(icp: dict, lead: dict, fetcher, sem: asyncio.Semaphore) -> dict:
+async def review_lead(icp: dict, lead: dict, fetcher, sem: asyncio.Semaphore, contact: dict | None = None) -> dict:
     website = normalise_url(lead.get("website"))
     pages, reason = [], None
     async with sem:
@@ -1602,7 +1770,7 @@ async def review_lead(icp: dict, lead: dict, fetcher, sem: asyncio.Semaphore) ->
             reason = "banned_host"
         else:
             pages, reason = await _crawl_review(fetcher, website)
-        signals = merged_signals(pages) if pages else {}
+        signals = _attach_channels(merged_signals(pages) if pages else {}, lead, contact)
         review = await _llm_review(icp, lead, signals, pages) if pages else None
     fallback = review is None
     score, summary = signals_review(icp, lead, signals, pages)
@@ -1624,15 +1792,21 @@ async def qualify_leads(args: dict, ctx=None) -> dict:
     if not isinstance(icp, dict):
         raise ValueError("missing 'icp'")
     sem = asyncio.Semaphore(ANALYST_CONCURRENCY)
+    by_lead = {}
+    for contact in args.get("contacts") or []:
+        if isinstance(contact, dict):
+            by_lead.setdefault(contact.get("lead_id"), contact)
     start = time.monotonic()
     async with PoliteFetcher() as fetcher:
         async def one(lead: dict) -> dict:
+            contact = by_lead.get(lead["id"])
             try:
-                return await review_lead(icp, lead, fetcher, sem)
+                return await review_lead(icp, lead, fetcher, sem, contact)
             except Exception:  # noqa: BLE001
-                score, summary = signals_review(icp, lead, {}, [])
-                return {"lead_id": lead["id"], "reachable": False, "unreachable_reason": "unreachable", "signals": {},
-                        "fit_score": score, "hooks": [], "summary": summary, "fallback": True}
+                signals = _attach_channels({}, lead, contact)
+                score, summary = signals_review(icp, lead, signals, [])
+                return {"lead_id": lead["id"], "reachable": False, "unreachable_reason": "unreachable",
+                        "signals": signals, "fit_score": score, "hooks": [], "summary": summary, "fallback": True}
 
         tasks = [asyncio.create_task(one(lead)) for lead in leads]
         _, pending = await asyncio.wait(tasks, timeout=analyst_budget())
@@ -1783,16 +1957,17 @@ async def draft_one(profile, lead, contact, review, style_rules, sem, product=""
     if not contact or not contact.get("email"):
         return None, {"lead_id": lead["id"], "reason": "no_contact"}
     said = "; ".join(x for x in (product, brief) if x)
+    context = _lead_for_writer(lead, contact)
     async with sem:
         try:
-            raw = await _llm_draft(profile, lead, review, style_rules, product, brief)
+            raw = await _llm_draft(profile, context, review, style_rules, product, brief)
         except Exception as err:  # noqa: BLE001
             log.warning(f"no draft for {lead['id']}: {_draft_why(err)}")
             return None, {"lead_id": lead["id"], "reason": "llm_failed", "detail": _draft_why(err)}
         problems = validate(raw, profile, review, said)
         if any(PROFILE_GAP not in problem for problem in problems):
             try:
-                retry = await _llm_draft(profile, lead, review, style_rules, product, brief, problems=problems)
+                retry = await _llm_draft(profile, context, review, style_rules, product, brief, problems=problems)
                 raw, problems = retry, validate(retry, profile, review, said)
             except Exception as err:  # noqa: BLE001
                 log.warning(f"regenerating the draft for {lead['id']} failed, keeping the first one: "
@@ -1931,6 +2106,19 @@ def lead_pack_card(req: RequestPayment) -> ChatMessage:
         "primary": True,
     }]
     narration = f"**Harvest Agent lead pack**\n{_numbered(rows)}\n\nDemo only, no real funds move."
+    return detail_card("Harvest Agent lead pack", rows, ctas, narration)
+
+
+def buy_pack_card(price: str) -> ChatMessage:
+    """Offered after the dry-run summary. The button starts the lead-pack card flow."""
+    label = f"Buy lead pack ({price} FET, demo)"
+    rows = [{"label": "Price", "value": f"{price} FET, demo"}]
+    ctas = [{
+        "label": label,
+        "selection": {"action": "buy_lead_pack", "step": "send"},
+        "primary": True,
+    }]
+    narration = f"Want the **Harvest Agent lead pack**? {label}.\n\nDemo only, no real funds move."
     return detail_card("Harvest Agent lead pack", rows, ctas, narration)
 
 
@@ -2080,12 +2268,25 @@ SPECIALIST_NAMES = {"find_leads": "Lead Finder", "find_contacts": "Contact Finde
                     "draft_emails": "Copywriter", "send_emails": "Sender"}
 GATE_TOOL = {"leads": "find_leads", "contacts": "find_contacts", "reviews": "qualify_leads",
              "drafts": "draft_emails", "send": "send_emails"}
-PROGRESS = {
-    "leads": "Searching OpenStreetMap and the web for matching businesses, then verifying their websites...",
-    "contacts": "Visiting each website politely to find published emails and phone numbers...",
-    "reviews": "Reviewing each website for evidence that it fits your offer...",
-    "drafts": "Drafting a short personal email for each lead...",
-    "send": "Queueing approved emails...",
+TOOL_GATE = {tool: gate for gate, tool in GATE_TOOL.items()}
+REMOTE_NAMES = {
+    "find_leads": "Harvest Finder",
+    "find_contacts": "Harvest Contacts",
+    "qualify_leads": "Harvest Analyst",
+    "draft_emails": "Harvest Writer",
+    "send_emails": "Harvest Sender",
+}
+STEP_LABELS = {
+    "leads": "Finder", "contacts": "Contacts", "reviews": "Analyst", "drafts": "Writer", "send": "Sender",
+}
+INLINE_ACTOR = "Harvest Agent, inline fallback"
+STEP_ACKS = {
+    "icp": "On it, I'm building the customer profile…",
+    "leads": "On it, the Finder agent is searching…",
+    "contacts": "On it, the Contacts agent is looking up published details…",
+    "reviews": "On it, the Analyst agent is reviewing the leads…",
+    "drafts": "On it, the Writer agent is drafting emails…",
+    "send": "On it, recording the dry run…",
 }
 FAST_INTENTS = {
     "approve": "approve", "yes": "approve", "ok": "approve", "looks good": "approve",
@@ -2142,13 +2343,46 @@ async def _remote(ctx: Context, tool: str, args: dict, address: str):
         if isinstance(reply, ToolResponse):
             ctx.logger.info(f"{tool} {rid[:8]} response after {took:.1f}s ({attempt}, ok={reply.ok})")
             if not reply.ok:
-                return None, reply.error or "unknown error", False
+                ctx.logger.warning(
+                    f"{tool} {rid[:8]} remote error, inline fallback: {redact(reply.error or 'unknown error')}")
+                return None, reply.error or "unknown error", True
             try:
                 return json.loads(reply.result or "{}"), "", False
             except ValueError:
-                return None, f"the {tool} agent returned invalid JSON", False
+                ctx.logger.warning(f"{tool} {rid[:8]} invalid JSON, inline fallback")
+                return None, f"the {tool} agent returned invalid JSON", True
         ctx.logger.warning(f"{tool} {rid[:8]} no response after {took:.1f}s ({attempt}, status {status})")
     return None, "timeout", True
+
+
+def remote_actor(tool: str, address: str) -> str:
+    return f"{REMOTE_NAMES.get(tool, tool)} ({address[:12]}…)"
+
+
+def remember_actor(camp: dict | None, tool: str, actor: str) -> None:
+    gate = TOOL_GATE.get(tool)
+    if camp is None or not gate:
+        return
+    rows = [row for row in (camp.get("step_actors") or []) if isinstance(row, dict) and row.get("gate") != gate]
+    rows.append({"gate": gate, "actor": actor})
+    camp["step_actors"] = rows
+
+
+def steps_report(camp: dict) -> list[tuple[str, str]]:
+    by_gate = {}
+    for row in camp.get("step_actors") or []:
+        if isinstance(row, dict) and row.get("gate") in STEP_LABELS and row.get("actor"):
+            by_gate[row["gate"]] = row["actor"]
+    return [(STEP_LABELS[gate], by_gate[gate]) for gate in STEP_LABELS if gate in by_gate]
+
+
+def steps_text(camp: dict) -> str:
+    rows = steps_report(camp)
+    if not rows:
+        return ""
+    lines = ["Steps: " + " → ".join(label for label, _actor in rows)]
+    lines.extend(f"{label}: {actor}" for label, actor in rows)
+    return "\n".join(lines)
 
 
 async def _inline_tool(ctx: Context, tool: str, args: dict) -> tuple[dict | None, str]:
@@ -2164,22 +2398,28 @@ async def _inline_tool(ctx: Context, tool: str, args: dict) -> tuple[dict | None
         return None, f"{name} timed out (inline run: {why})" if isinstance(err, asyncio.TimeoutError) else why
 
 
-async def call_tool(ctx: Context, tool: str, args: dict) -> tuple[dict | None, str]:
+async def call_tool(ctx: Context, tool: str, args: dict, camp: dict | None = None) -> tuple[dict | None, str]:
     # Sending is hard-coded dry-run. The hosted sender replies that send_emails is not
     # implemented, so this step never calls it.
     if tool == "send_emails":
         ctx.logger.info("send_emails uses the inline dry run; the remote sender is not called")
-        return await _inline_tool(ctx, tool, args)
+        result, error = await _inline_tool(ctx, tool, args)
+        remember_actor(camp, tool, INLINE_ACTOR)
+        return result, error
     env_name = SPECIALISTS[tool][0]
     address = os.getenv(env_name, "").strip()
     if address:
-        result, error, timed_out = await _remote(ctx, tool, args, address)
-        if not timed_out:
+        result, error, fallback = await _remote(ctx, tool, args, address)
+        if not fallback:
+            remember_actor(camp, tool, remote_actor(tool, address))
             return result, error
-        ctx.logger.warning(f"fallback: inline {tool} (remote timed out)")
+        why = "remote timed out" if error == "timeout" else "remote error"
+        ctx.logger.warning(f"fallback: inline {tool} ({why})")
     else:
         ctx.logger.info(f"fallback: inline {tool} (no {env_name})")
-    return await _inline_tool(ctx, tool, args)
+    result, error = await _inline_tool(ctx, tool, args)
+    remember_actor(camp, tool, INLINE_ACTOR)
+    return result, error
 
 
 def dry_run_summary(camp: dict) -> str:
@@ -2196,7 +2436,15 @@ def dry_run_summary(camp: dict) -> str:
         lines.append(f"- {business} — {recipient} — {subject}")
     if len(lines) == 2:
         lines.append("- No approved drafts to record.")
+    for item in camp.get("contact_skipped") or []:
+        if item.get("note") != "no email: phone/IG available":
+            continue
+        business = names.get(item.get("lead_id")) or item.get("lead_id") or "Unknown business"
+        lines.append(f"- {business} — no email: phone/IG available")
     lines += ["", "No email went out. Real sending is off for the demo."]
+    report = steps_text(camp)
+    if report:
+        lines += ["", report]
     return "\n".join(lines)
 
 
@@ -2248,7 +2496,12 @@ def checkpoint(gate: str, camp: dict, note: str = "") -> ChatMessage:
                           f"{'⚠ low' if c.get('confidence') == 'low' else c.get('confidence', '?')}"}
                 for i, c in enumerate(camp["contacts"], 1)]
         camp["last_list"] = [c["lead_id"] for c in camp["contacts"]]
-        return review_card(f"{len(rows)} contacts found", rows, "contacts", "Approve & review websites")
+        for item in camp.get("contact_skipped") or []:
+            if item.get("note") != "no email: phone/IG available":
+                continue
+            rows.append({"label": names.get(item.get("lead_id"), item.get("lead_id")),
+                         "value": "no email: phone/IG available"})
+        return review_card(f"{len(camp['contacts'])} contacts found", rows, "contacts", "Approve & review websites")
     if gate == "reviews":
         names = {lead["id"]: lead["name"] for lead in camp["leads"]}
         rows = []
@@ -2297,6 +2550,7 @@ def store_result(gate: str, camp: dict, result: dict) -> int:
         return len(camp["leads"])
     if gate == "contacts":
         camp["contacts"] = result.get("contacts", [])
+        camp["contact_skipped"] = result.get("skipped", [])
         return len(camp["contacts"])
     if gate == "reviews":
         camp["reviews"] = result.get("reviews", [])
@@ -2332,8 +2586,19 @@ async def build_icp_step(ctx: Context, sender: str, camp: dict) -> None:
     audit(camp, "icp", "built", "system", json.dumps(camp["icp"])[:300])
 
 
+async def _ack_step(ctx: Context, sender: str, camp: dict, gate: str) -> None:
+    """Short chat reply before a long step. A handoff that already sent it sets acked_gate."""
+    if camp.get("acked_gate") == gate:
+        camp["acked_gate"] = None
+        return
+    text = STEP_ACKS.get(gate)
+    if text:
+        await ctx.send(sender, chat_text(text))
+
+
 async def run_from(ctx: Context, sender: str, camp: dict, gate: str) -> None:
     while gate:
+        await _ack_step(ctx, sender, camp, gate)
         if gate == "icp":
             await build_icp_step(ctx, sender, camp)
             if camp["state"] != BUILDING_ICP:
@@ -2341,9 +2606,7 @@ async def run_from(ctx: Context, sender: str, camp: dict, gate: str) -> None:
         else:
             camp["state"] = GATE_STATES[gate][0]
             save(ctx, sender, camp)
-            if gate != "send":
-                await ctx.send(sender, chat_text(PROGRESS[gate]))
-            result, error = await call_tool(ctx, GATE_TOOL[gate], step_args(gate, camp))
+            result, error = await call_tool(ctx, GATE_TOOL[gate], step_args(gate, camp), camp)
             if gate == "send" and result is None:
                 # A remote "not implemented" reply must not reach the user. Record the dry run here.
                 ctx.logger.info("send step returned no result; recording the inline dry run instead")
@@ -2364,7 +2627,12 @@ async def run_from(ctx: Context, sender: str, camp: dict, gate: str) -> None:
             if gate == "send":
                 camp["state"] = DONE
                 audit(camp, "send", "dry run recorded", "system")
-                await ctx.send(sender, chat_text(dry_run_summary(camp), end_session=True))
+                price = leadpack_amount()
+                if price:
+                    await ctx.send(sender, chat_text(dry_run_summary(camp)))
+                    await ctx.send(sender, buy_pack_card(price))
+                else:
+                    await ctx.send(sender, chat_text(dry_run_summary(camp), end_session=True))
                 return
             if gate in ("leads", "drafts") and count == 0:
                 camp["state"] = GATE_STATES[gate][1]
@@ -2418,7 +2686,7 @@ async def redraft(ctx: Context, sender: str, camp: dict, lead_ids: list[str], ex
     if not args["leads"]:
         return "those leads are no longer in the campaign"
     await ctx.send(sender, chat_text("Rewriting..."))
-    result, error = await call_tool(ctx, "draft_emails", args)
+    result, error = await call_tool(ctx, "draft_emails", args, camp)
     if result is None:
         return error
     log_draft_skips(ctx, result)
@@ -2720,12 +2988,77 @@ def cap_blocks(camp: dict, fast: dict | None) -> bool:
     return fast is None
 
 
-@chat_proto.on_message(ChatMessage)
-async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
-    await ctx.send(sender, ack(msg))
-    text = text_of(msg)
-    if not text:
-        return
+# Sent to this agent so a long step survives the chat handler returning.
+class StepJob(Model):
+    user: str
+    text: str
+
+
+# Tests set this so asyncio.run(handle_chat) still finishes the turn. Production stays False:
+# a hosted invocation ends when the handler returns, and a detached task would be dropped.
+DRAIN_JOBS = False
+_jobs: set[asyncio.Task] = set()
+
+
+def _track(task: asyncio.Task) -> asyncio.Task:
+    _jobs.add(task)
+    task.add_done_callback(_jobs.discard)
+    return task
+
+
+async def settle() -> None:
+    """Await chat turns scheduled on this loop. Tests call this; it is not durable state."""
+    while _jobs:
+        await asyncio.gather(*list(_jobs), return_exceptions=True)
+
+
+def own_address(ctx: Context) -> str:
+    for obj in (getattr(ctx, "agent", None), agent):
+        if obj is None:
+            continue
+        addr = getattr(obj, "address", None)
+        if callable(addr):
+            try:
+                addr = addr()
+            except Exception:  # noqa: BLE001
+                addr = None
+        if isinstance(addr, str) and addr.startswith("agent1"):
+            return addr
+    return ""
+
+
+def upcoming_long_gate(camp: dict, cmd: dict | None) -> str | None:
+    """The long step this command will start, so the chat handler can ack before returning."""
+    if not cmd:
+        return None
+    intent, args = cmd.get("intent"), cmd.get("args") or {}
+    if intent == "start_campaign":
+        if (args.get("brief") or "").strip() and (args.get("city") or "").strip():
+            return "icp"
+        return None
+    gate = pending_gate(camp)
+    if camp.get("state") == STEP_FAILED:
+        gate = camp.get("failed_gate") or gate
+    if intent == "approve" and gate:
+        if camp.get("pending_style_rule") and gate == "drafts":
+            return "drafts"
+        if gate == "drafts" and camp.get("drafts"):
+            cursor = int(camp.get("draft_cursor") or 0)
+            last = bool(args.get("all")) or cursor + 1 >= len(camp["drafts"])
+            return "send" if last else None
+        return next_gate(gate)
+    if intent == "retry":
+        return gate
+    if intent == "skip" and gate:
+        return next_gate(gate)
+    if intent == "reject" and gate == "icp":
+        return "icp"
+    if intent == "edit_draft" and gate == "drafts" and str(args.get("instruction") or "").strip():
+        return "drafts"
+    return None
+
+
+async def _chat_turn(ctx: Context, sender: str, text: str) -> None:
     ctx.logger.info(f"user {sender[:16]}...: {text[:200]}")
     camp = load(ctx, sender)
     try:
@@ -2745,6 +3078,49 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
             "Something went wrong on my side. Your campaign is saved - say **status** to see where we are, or **retry**."))
     finally:
         save(ctx, sender, camp)
+
+
+@chat_proto.on_message(ChatMessage)
+async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
+    await ctx.send(sender, ack(msg))
+    text = text_of(msg)
+    if not text:
+        return
+    if DRAIN_JOBS:
+        await _chat_turn(ctx, sender, text)
+        return
+    camp = load(ctx, sender)
+    try:
+        fast = fast_command(text, camp)
+        if over_cap(ctx, sender) and cap_blocks(camp, fast):
+            await ctx.send(sender, chat_text(LIMIT_MSG))
+            return
+        # Unknown text needs the intent model. A known long step needs a specialist.
+        # Both leave this handler after the ack; StepJob runs them on the next call.
+        gate = upcoming_long_gate(camp, fast) if fast else None
+        if fast is None or gate:
+            if gate and STEP_ACKS.get(gate):
+                await ctx.send(sender, chat_text(STEP_ACKS[gate]))
+                camp["acked_gate"] = gate
+                save(ctx, sender, camp)
+            dest = own_address(ctx)
+            if dest:
+                await ctx.send(dest, StepJob(user=sender, text=text))
+                return
+            # No agent address to hand off to. Keep the task on this loop instead of a thread.
+            _track(asyncio.create_task(_chat_turn(ctx, sender, text)))
+            return
+    except Exception:  # noqa: BLE001
+        ctx.logger.exception("handler failed")
+        await ctx.send(sender, chat_text(
+            "Something went wrong on my side. Your campaign is saved - say **status** to see where we are, or **retry**."))
+        return
+    await _chat_turn(ctx, sender, text)
+
+
+@agent.on_message(StepJob)
+async def on_step_job(ctx: Context, sender: str, msg: StepJob):
+    await _chat_turn(ctx, msg.user, msg.text)
 
 
 @chat_proto.on_message(ChatAcknowledgement)
