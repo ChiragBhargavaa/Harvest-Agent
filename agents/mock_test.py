@@ -1188,6 +1188,7 @@ def supervisor_tests():
 async def run_script(ctx: Context):
     await asyncio.sleep(2)
     orchestrator.agent.storage.remove(st.storage_key(user.address))  # start clean: storage persists between runs
+    orchestrator.agent.storage.remove(orchestrator.CAP_KEY)  # the daily cap persists too; this script must not inherit it
     try:
         await unit_tests()
 
@@ -1659,11 +1660,107 @@ async def cap_tests():
                 os.environ[key] = value
 
 
+async def send_log_tests():
+    """Every orchestrator reply is send_reliably: one status line, no body, at most two retries."""
+    from uagents_core.types import DeliveryStatus, MsgStatus
+
+    from common import send_reliably
+
+    class Capture(logging.Handler):
+        def __init__(self):
+            super().__init__(logging.INFO)
+            self.lines: list[str] = []
+
+        def emit(self, record):
+            self.lines.append(record.getMessage())
+
+    capture = Capture()
+    log = logging.getLogger("mock-send-log")
+    log.handlers = [capture]
+    log.setLevel(logging.INFO)
+    log.propagate = False
+    body = "UNIQUE-BODY-should-not-be-logged"
+    dest = "agent1qsenderlogtest"
+
+    def status(kind):
+        return MsgStatus(status=kind, detail="route", destination=dest, endpoint="", session=None)
+
+    class Flaky:
+        def __init__(self, script):
+            self.script, self.calls, self.logger = list(script), 0, log
+
+        async def send(self, to, msg):
+            self.calls += 1
+            step = self.script.pop(0)
+            if isinstance(step, Exception):
+                raise step
+            return step
+
+    failed, delivered = status(DeliveryStatus.FAILED), status(DeliveryStatus.DELIVERED)
+    ctx = Flaky([failed, failed, delivered])
+    result = await send_reliably(ctx, dest, chat_text(body))
+    prefix = f"chat sent to {dest[:14]}… status="
+    check(ctx.calls == 3 and result is delivered,
+          "send_reliably: a failed delivery is retried twice, then the delivered status is kept")
+    check(capture.lines == [prefix + "failed", prefix + "failed", prefix + "delivered"]
+          and all(body not in line for line in capture.lines),
+          f"send log is one '<what> sent to <addr[:14]>… status=…' line and omits the body ({capture.lines})")
+
+    capture.lines.clear()
+    ctx = Flaky([RuntimeError(f"mailbox down quoting {body}"), delivered])
+    result = await send_reliably(ctx, dest, chat_text(body))
+    check(ctx.calls == 2 and result is delivered and capture.lines[0] == prefix + "RuntimeError"
+          and body not in capture.lines[0] and capture.lines[1] == prefix + "delivered",
+          f"send_reliably: an exception is retried and logged without the quoted body ({capture.lines})")
+
+    ctx = Flaky([RuntimeError("mailbox down")] * 4)
+    result = await send_reliably(ctx, dest, chat_text("hi"))
+    check(ctx.calls == 3 and result is None, "send_reliably: at most 2 retries, then it stops")
+
+    source = Path(__file__).with_name("orchestrator.py").read_text()
+    check("ctx.send(" not in source and "send_and_receive(" in source,
+          "orchestrator: user sends go through send_reliably; specialist send_and_receive is unchanged")
+
+    buyer = "agent1qorchsendlog"
+
+    class OrchCtx(FakePayCtx):
+        def __init__(self):
+            super().__init__()
+            self.logger = log
+
+        async def send(self, to, msg):
+            self.sent.append((to, msg))
+            return status(DeliveryStatus.DELIVERED)
+
+    def sent_lines():
+        return [line for line in capture.lines if " sent to " in line]
+
+    capture.lines.clear()
+    await orchestrator.handle_chat(OrchCtx(), buyer, chat_text("help"))
+    lines = sent_lines()
+    expect = f"sent to {buyer[:14]}… status=delivered"
+    check([line.split(" sent to ")[0] for line in lines] == ["ack", "chat"] and all(expect in line for line in lines),
+          f"orchestrator help logs the ack and the chat ({lines})")
+
+    capture.lines.clear()
+    await orchestrator.handle_chat(OrchCtx(), buyer, chat_text("new campaign"))
+    lines = sent_lines()
+    check([line.split(" sent to ")[0] for line in lines] == ["ack", "form"] and all(expect in line for line in lines),
+          f"orchestrator setup form is logged as form ({lines})")
+
+    capture.lines.clear()
+    await orchestrator.handle_chat(OrchCtx(), buyer, chat_text("status"))
+    lines = sent_lines()
+    check([line.split(" sent to ")[0] for line in lines] == ["ack", "card"] and all(expect in line for line in lines),
+          f"orchestrator status card is logged as card ({lines})")
+
+
 _saved_recipient = os.environ.pop("LEADPACK_RECIPIENT", None)  # the payment checks expect the default recipient
 _saved_default_recipient = orchestrator.payments.DEFAULT_RECIPIENT
 _pay_loop = asyncio.new_event_loop()  # a private loop: the Bureau's loop is left untouched
 try:
     _pay_loop.run_until_complete(cap_tests())
+    _pay_loop.run_until_complete(send_log_tests())
     _pay_loop.run_until_complete(payment_tests())
     _pay_loop.run_until_complete(orchestrator_live_fix_tests())
 finally:
