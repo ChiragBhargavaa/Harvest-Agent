@@ -21,6 +21,7 @@ from uagents_core.contrib.protocols.chat import ChatAcknowledgement, ChatMessage
 
 import cards
 import llm
+import payments
 import state as st
 from common import ROOT, ToolRequest, ToolResponse, ack, chat_text, env_bool, env_seconds, redact, require_env, text_of
 
@@ -49,6 +50,7 @@ FAST_INTENTS = {  # exact phrases handled without an LLM call
     "log": "show_log", "show log": "show_log", "new campaign": "start_campaign", "start": "start_campaign",
     "call list": "call_list",
 }
+FAST_INTENTS.update(payments.FAST_INTENTS)  # "buy lead pack" / "unlock full list" (optional Payment Protocol demo)
 STYLE_RULE_DECLINE = {"no", "just this one", "just this draft", "only this one", "only this draft"}
 SKIP_REASONS = {"no_contact": "no email found", "llm_failed": "the writer failed"}
 HELP = (
@@ -594,6 +596,8 @@ async def dispatch(ctx: Context, sender: str, camp: dict, cmd: dict) -> dict:
         await ctx.send(sender, chat_text("**Phone-only businesses** (no published email)\n" + body))
     elif intent == "edit_draft":
         await edit_draft(ctx, sender, camp, args)
+    elif intent == "buy_lead_pack":
+        await payments.offer(ctx, sender, camp)
     elif intent in ("add_lead", "import_list", "classify_reply"):
         await ctx.send(sender, chat_text(f"*{intent.replace('_', ' ')}* isn't part of this demo yet. {HELP}"))
     elif camp["state"] in (st.IDLE, st.SETUP, st.DONE) and cmd.get("confidence", 0) < 0.6:
@@ -629,6 +633,7 @@ async def handle_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
 
 # publish_manifest=True advertises the Chat Protocol so ASI:One can discover and talk to this agent
 agent.include(chat_proto, publish_manifest=True)
+agent.include(payments.pay_proto, publish_manifest=True)  # Payment Protocol, seller role (agents/payments.py)
 
 
 @agent.on_event("startup")

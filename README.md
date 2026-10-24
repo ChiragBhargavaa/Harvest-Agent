@@ -56,7 +56,12 @@ Brand ──ASI:One chat──▶ leadreach (orchestrator: Chat Protocol, Intera
 ```
 
 Fetch.ai tech: uAgents, Agentverse (mailbox + profiles), Agent Chat Protocol, ASI:One LLM (including web search), ASI
-Interactive Cards. Payment Protocol is not part of this submission.
+Interactive Cards, and the Agent Payment Protocol.
+
+**Payment Protocol (optional demo):** `leadreach` is a seller (`agents/payments.py`). Say **buy lead pack** to get a
+`RequestPayment` (default 0.1 FET) for the verified contacts and their source URLs. A matching `CommitPayment` gets `CompletePayment`
+plus the pack; anything else gets `CancelPayment`. Verification is a labelled demo check, not on-chain. The free flow and the approval
+gates never depend on it.
 
 **Guardrails:** emails come only from pages we crawled (never from the LLM). Websites suggested by web search count only after
 crawling confirms the business. We respect robots.txt and OSM usage policies, never scrape Google Maps, Justdial, Instagram and
