@@ -121,6 +121,7 @@ def tool_digest(request_model, response_model) -> str:
 
 
 mod, stub = load_orchestrator()
+mod.DRAIN_JOBS = True
 
 
 def test_file_compiles_and_protocols_match():
@@ -731,6 +732,124 @@ def test_lead_pack_card_survives_bounced_request_and_simulates():
     assert "verified lead pack" not in done
 
 
+def test_remote_error_falls_back_and_records_inline_actor():
+    ctx = FakeCtx()
+
+    async def fake_http(method, url, **kwargs):
+        if "nominatim" in url:
+            body = [{
+                "display_name": "Jaipur, Rajasthan, India",
+                "lat": "26.9", "lon": "75.8",
+                "boundingbox": ["26.7", "27.1", "75.6", "76.0"],
+            }]
+        else:
+            body = {"elements": [{
+                "type": "node", "id": 7, "lat": 26.9, "lon": 75.8,
+                "tags": {"name": "Fallback Cafe", "amenity": "cafe", "website": "https://fallback.test",
+                         "email": "hi@fallback.test"},
+            }]}
+        return {"status": 200, "headers": {"Content-Type": "application/json"}, "content": json.dumps(body).encode(),
+                "url": url}
+
+    async def remote(destination, message, response_type=None, timeout=30):
+        ctx.remote_calls += 1
+        return mod.ToolResponse(ok=False, error="overpass down"), "ok"
+
+    ctx.send_and_receive = remote
+    mod.http_request = fake_http
+    os.environ["LEAD_FINDER_AGENT_ADDRESS"] = "agent1qfinderxxxxxxxx"
+    camp = mod.fresh_campaign()
+    try:
+        async def run():
+            return await mod.call_tool(ctx, "find_leads", {
+                "icp": {"city": "Jaipur", "business_types": ["cafe"], "osm_tags": ["amenity=cafe"],
+                        "search_queries": []},
+                "limit": 5,
+            }, camp)
+
+        result, error = asyncio.run(run())
+    finally:
+        os.environ.pop("LEAD_FINDER_AGENT_ADDRESS", None)
+    assert error == "", error
+    assert result["leads"][0]["name"] == "Fallback Cafe"
+    assert ctx.remote_calls == 1
+    assert camp["step_actors"] == [{"gate": "leads", "actor": "Harvest Agent, inline fallback"}]
+
+
+def test_handler_returns_before_the_finder_and_records_who():
+    """Approving the ICP acks immediately. The long search runs on the next invocation."""
+    ctx = FakeCtx()
+    addr = "agent1qfinderxxxxxxxx"
+    os.environ["LEAD_FINDER_AGENT_ADDRESS"] = addr
+    camp = mod.fresh_campaign()
+    camp["state"] = mod.AWAIT_ICP
+    camp["target"]["city"] = "Jaipur"
+    camp["icp"] = {
+        "city": "Jaipur", "product": "beans", "business_types": ["cafe"],
+        "osm_tags": ["amenity=cafe"], "search_queries": [], "fit_criteria": [],
+    }
+    ctx.storage.set(mod.storage_key(SENDER), camp)
+    calls = []
+
+    async def remote(destination, message, response_type=None, timeout=30):
+        calls.append("remote-start")
+        await asyncio.sleep(0.05)
+        calls.append("remote-end")
+        return mod.ToolResponse(ok=True, result=json.dumps({
+            "leads": [{"id": "osm:node/9", "name": "Remote Cafe"}],
+            "call_list": [], "source_notes": ["remote"],
+        })), "sent"
+
+    ctx.send_and_receive = remote
+    mod.DRAIN_JOBS = False
+    try:
+        async def handoff():
+            await mod.handle_chat(ctx, SENDER, chat("approve"))
+            calls.append("handler-returned")
+
+        asyncio.run(handoff())
+        assert calls == ["handler-returned"]
+        assert [type(msg).__name__ for _, msg in ctx.sent] == ["ChatAcknowledgement", "ChatMessage", "StepJob"]
+        assert ctx.sent[1][0] == SENDER
+        assert "On it, the Finder agent is searching…" in texts(ctx)[0]
+        assert ctx.sent[2][0] == ctx.agent.address
+        job = ctx.sent[2][1]
+        assert job.user == SENDER and job.text == "approve"
+        assert ctx.storage.get(mod.storage_key(SENDER))["acked_gate"] == "leads"
+
+        async def cont():
+            await mod.on_step_job(ctx, ctx.agent.address, job)
+
+        asyncio.run(cont())
+    finally:
+        mod.DRAIN_JOBS = True
+        os.environ.pop("LEAD_FINDER_AGENT_ADDRESS", None)
+
+    assert calls == ["handler-returned", "remote-start", "remote-end"]
+    assert sum("On it, the Finder agent is searching…" in item for item in texts(ctx)) == 1
+    assert any("Remote Cafe" in item for item in texts(ctx))
+    saved = ctx.storage.get(mod.storage_key(SENDER))
+    actor = f"Harvest Finder ({addr[:12]}…)"
+    assert saved["step_actors"] == [{"gate": "leads", "actor": actor}]
+    assert saved.get("acked_gate") in (None, "")
+    saved["step_actors"] = saved["step_actors"] + [
+        {"gate": "contacts", "actor": "Harvest Agent, inline fallback"},
+        {"gate": "reviews", "actor": "Harvest Analyst (agent1qv6pdx6q…)"},
+        {"gate": "drafts", "actor": "Harvest Writer (agent1qd5wnskl…)"},
+    ]
+    saved["drafts"] = [{
+        "lead_id": "osm:node/9", "to": "owner@cafe.test", "subject": "Hello", "approved": True,
+    }]
+    summary = mod.dry_run_summary(saved)
+    assert "Steps: Finder → Contacts → Analyst → Writer" in summary
+    assert f"Finder: {actor}" in summary
+    assert "Contacts: Harvest Agent, inline fallback" in summary
+    labels = {row["label"]: row["value"] for row in _card_payload(mod.status_card(saved))["summary_rows"]}
+    assert labels["Finder"] == actor
+    assert labels["Contacts"] == "Harvest Agent, inline fallback"
+    assert labels["Writer"] == "Harvest Writer (agent1qd5wnskl…)"
+
+
 if __name__ == "__main__":
     test_file_compiles_and_protocols_match()
     test_logger_calls_take_one_message()
@@ -746,4 +865,6 @@ if __name__ == "__main__":
     test_overpass_failover_and_partial_website_lookup()
     test_finder_overpass_mirrors()
     test_lead_pack_card_survives_bounced_request_and_simulates()
+    test_remote_error_falls_back_and_records_inline_actor()
+    test_handler_returns_before_the_finder_and_records_who()
     print("hosted tests ok")
