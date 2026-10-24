@@ -16,7 +16,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "agents"))
 
 from uagents import Protocol  # noqa: E402
-from uagents_core.contrib.protocols.chat import ChatMessage, MetadataContent, TextContent  # noqa: E402
+from uagents_core.contrib.protocols.chat import (  # noqa: E402
+    ChatMessage,
+    EndSessionContent,
+    MetadataContent,
+    TextContent,
+)
 from uagents_core.contrib.protocols.payment import payment_protocol_spec  # noqa: E402
 from uagents_core.models import Model  # noqa: E402
 
@@ -444,6 +449,7 @@ def test_remote_sender_not_implemented_still_dry_runs():
     ctx = FakeCtx()
     os.environ["SENDER_AGENT_ADDRESS"] = "agent1qsender"
     os.environ.pop("TEST_REDIRECT_TO", None)
+    os.environ.pop("LEADPACK_PRICE", None)
 
     async def remote(destination, message, response_type=None, timeout=30):
         ctx.remote_calls += 1
@@ -492,6 +498,73 @@ def test_remote_sender_not_implemented_still_dry_runs():
     assert outbox[0]["to"] == "owner@brew.test"
     assert outbox[0]["subject"] == "Hello from the roaster"
     assert outbox[0]["dry_run"] is True
+    assert "Buy lead pack" not in joined
+    assert any(
+        isinstance(part, EndSessionContent)
+        for _, msg in ctx.sent if isinstance(msg, ChatMessage) for part in msg.content
+    )
+
+
+def test_priced_dry_run_offers_buy_button():
+    """LEADPACK_PRICE adds a buy button after the summary. Unset has no button (covered above)."""
+    ctx = FakeCtx()
+    os.environ["LEADPACK_PRICE"] = "0.25"
+    os.environ.pop("LEADPACK_RECIPIENT", None)
+    os.environ.pop("TEST_REDIRECT_TO", None)
+    camp = mod.fresh_campaign()
+    camp["state"] = mod.AWAIT_DRAFTS
+    camp["campaign_id"] = "camp-buy"
+    camp["target"]["city"] = "Jaipur"
+    camp["leads"] = [{"id": "web:brew", "name": "Brew Lab", "website": "https://brew.test"}]
+    camp["contacts"] = [{
+        "lead_id": "web:brew", "email": "owner@brew.test", "role": "owner",
+        "source_url": "https://brew.test",
+    }]
+    camp["drafts"] = [{
+        "lead_id": "web:brew", "to": "owner@brew.test", "subject": "Hello",
+        "body_text": "Hi there", "approved": False,
+    }]
+    camp["draft_cursor"] = 0
+    ctx.storage.set(mod.storage_key(SENDER), camp)
+    try:
+        async def run():
+            await mod.handle_chat(ctx, SENDER, chat("approve"))
+            cards = [msg for _, msg in ctx.sent if _card_payload(msg)]
+            assert len(cards) == 1
+            payload = _card_payload(cards[0])
+            assert payload["ctas"][0]["label"] == "Buy lead pack (0.25 FET, demo)"
+            assert payload["ctas"][0]["selection"]["action"] == "buy_lead_pack"
+            shown = texts(ctx)
+            summary_at = next(i for i, item in enumerate(shown) if "Dry run, nothing was sent" in item)
+            button_at = next(i for i, item in enumerate(shown) if "Buy lead pack (0.25 FET, demo)" in item)
+            assert summary_at < button_at
+            assert not any(
+                isinstance(part, EndSessionContent)
+                for _, msg in ctx.sent if isinstance(msg, ChatMessage) for part in msg.content
+            )
+            saved = ctx.storage.get(mod.storage_key(SENDER))
+            assert saved["drafts"][0]["body_text"] == "Hi there"
+            assert "0.25" not in saved["drafts"][0]["body_text"]
+            await mod.handle_chat(ctx, SENDER, chat(json.dumps({"action": "buy_lead_pack", "step": "send"})))
+
+        asyncio.run(run())
+    finally:
+        os.environ.pop("LEADPACK_PRICE", None)
+
+    request = next(msg for _, msg in ctx.sent if type(msg).__name__ == "RequestPayment")
+    assert request.accepted_funds[0].amount == "0.25"
+    assert request.accepted_funds[0].currency == "FET"
+    assert request.recipient == "fetch1" + "q" * 50
+    assert request.description.startswith("Harvest Agent lead pack")
+    simulate = None
+    for _, msg in ctx.sent:
+        payload = _card_payload(msg)
+        if payload and payload["ctas"][0]["label"] == "Simulate payment (demo)":
+            simulate = payload
+    assert simulate is not None
+    values = " ".join(row["value"] for row in simulate["summary_rows"])
+    assert "0.25 FET" in values
+    assert "Demo only, no real funds move" in values
 
 
 def _nominatim_body():
@@ -850,6 +923,117 @@ def test_handler_returns_before_the_finder_and_records_who():
     assert labels["Writer"] == "Harvest Writer (agent1qd5wnskl…)"
 
 
+def test_richer_contacts_are_context_and_email_only():
+    """Phone, site, Instagram and Facebook come from OSM tags and the page. Drafts stay email-only."""
+    ctx = FakeCtx()
+    html = (
+        "<html><head><title>Brew Lab</title>"
+        '<script type="application/ld+json">{"@type":"CafeOrCoffeeShop","telephone":"+91 141 234 5678"}</script>'
+        "</head><body>"
+        "<a href='mailto:hello@brew.test'>mail</a>"
+        "<a href='tel:+919876543210'>call</a>"
+        "<a href='https://www.instagram.com/brewlab/'>ig</a>"
+        "<a href='https://www.facebook.com/brewlab'>fb</a>"
+        "<a href='https://facebook.com/sharer/sharer.php?u=https://brew.test'>share</a>"
+        "Brew Lab</body></html>"
+    )
+    captured = []
+
+    async def fake_http(method, url, **kwargs):
+        if url.endswith("/robots.txt"):
+            return {"status": 404, "headers": {}, "content": b"", "url": url}
+        if "api.asi1.ai" in url:
+            captured.append(kwargs.get("json_body"))
+            draft = {"subject": "Hello", "hook_used": None,
+                     "body_text": "If you'd prefer not to hear from me again, just reply 'unsubscribe'."}
+            body = json.dumps({"choices": [{"message": {"content": json.dumps(draft)}}]}).encode()
+            return {"status": 200, "headers": {"Content-Type": "application/json"}, "content": body, "url": url}
+        return {"status": 200, "headers": {"Content-Type": "text/html"}, "content": html.encode(), "url": url}
+
+    mod.http_request = fake_http
+    mod.mx_ok = lambda domain: True
+    os.environ["ASI1_API_KEY"] = "test-key-not-real"
+    osm = mod._to_lead({
+        "type": "node", "id": 1, "lat": 26.9, "lon": 75.8,
+        "tags": {
+            "name": "Brew Lab", "amenity": "cafe", "website": "https://brew.test",
+            "phone": "+91 98290 11111", "contact:instagram": "brewlab",
+            "contact:facebook": "https://facebook.com/brewlab", "email": "owner@brew.test",
+        },
+    })
+    assert osm["phone"] == "+91 98290 11111"
+    assert osm["instagram"] == "brewlab"
+    assert osm["facebook"] == "https://facebook.com/brewlab"
+    assert osm["osm_emails"] == ["owner@brew.test"]
+    phone_only = {
+        "id": "osm:node/2", "name": "Phone Cafe", "website": None, "osm_emails": [],
+        "phone": "9829012345", "instagram": "phonecafe",
+    }
+    try:
+        async def run():
+            found = await mod.find_contacts({"leads": [osm, phone_only]}, ctx)
+            reviews = await mod.qualify_leads({
+                "icp": {"product": "beans", "business_types": ["cafe"], "osm_tags": ["amenity=cafe"],
+                        "fit_criteria": []},
+                "leads": [phone_only],
+                "contacts": [],
+            }, ctx)
+            drafts = await mod.draft_emails({
+                "profile": mod.load_profile(), "brief": "beans", "icp": {"product": "beans"},
+                "style_rules": [], "leads": [osm], "contacts": found["contacts"], "reviews": [],
+            }, ctx)
+            return found, reviews, drafts
+
+        found, reviews, drafts = asyncio.run(run())
+    finally:
+        os.environ.pop("ASI1_API_KEY", None)
+
+    brew = next(row for row in found["contacts"] if row["email"] == "hello@brew.test")
+    assert "+919829011111" in brew["phones"]
+    assert "+919876543210" in brew["phones"]
+    assert "+911412345678" in brew["phones"]
+    assert brew["instagram"] == "https://instagram.com/brewlab"
+    assert brew["facebook"] == "https://facebook.com/brewlab"
+    assert brew["website"] == "https://brew.test"
+    assert "sharer" not in brew["facebook"]
+    skipped = next(row for row in found["skipped"] if row["lead_id"] == "osm:node/2")
+    assert skipped["note"] == "no email: phone/IG available"
+    assert skipped["instagram"] == "phonecafe"
+    assert "9829012345" in skipped["phones"]
+    signals = reviews["reviews"][0]["signals"]
+    assert signals["instagram"] == "phonecafe"
+    assert "9829012345" in signals["phones"]
+    assert drafts["drafts"][0]["to"] == "hello@brew.test"
+    assert drafts["drafts"][0]["to"] not in {item for item in brew["phones"]}
+    sent = json.dumps(captured)
+    assert "https://instagram.com/brewlab" in sent
+    assert "hello@brew.test" in sent
+    camp = mod.fresh_campaign()
+    camp["leads"] = [osm, phone_only]
+    mod.store_result("contacts", camp, found)
+    summary = mod.dry_run_summary(dict(camp, drafts=[{
+        "lead_id": osm["id"], "to": "hello@brew.test", "subject": "Hello", "approved": True,
+    }]))
+    assert "Phone Cafe — no email: phone/IG available" in summary
+    card = _card_payload(mod.checkpoint("contacts", camp))
+    assert any(row["value"] == "no email: phone/IG available" for row in card["summary_rows"])
+
+    spec = importlib.util.spec_from_file_location("hosted_contacts_channels", ROOT / "hosted" / "contacts" / "agent.py")
+    contacts = importlib.util.module_from_spec(spec)
+    contacts.agent = StubAgent()
+    spec.loader.exec_module(contacts)
+    page = contacts.Page("https://brew.test", 200, html, 1, text="Brew Lab", links=[
+        "mailto:hello@brew.test", "tel:+919876543210",
+        "https://www.instagram.com/brewlab/", "https://www.facebook.com/brewlab",
+        "https://facebook.com/sharer/sharer.php?u=https://brew.test",
+    ])
+    channels = contacts._business_channels(osm, [page])
+    assert channels["instagram"] == "https://instagram.com/brewlab"
+    assert channels["facebook"] == "https://facebook.com/brewlab"
+    assert "+911412345678" in channels["phones"]
+    assert "+919876543210" in channels["phones"]
+
+
 if __name__ == "__main__":
     test_file_compiles_and_protocols_match()
     test_logger_calls_take_one_message()
@@ -862,9 +1046,11 @@ if __name__ == "__main__":
     test_contacts_reviews_drafts_and_unpriced_pack()
     test_remote_success_skips_inline()
     test_remote_sender_not_implemented_still_dry_runs()
+    test_priced_dry_run_offers_buy_button()
     test_overpass_failover_and_partial_website_lookup()
     test_finder_overpass_mirrors()
     test_lead_pack_card_survives_bounced_request_and_simulates()
     test_remote_error_falls_back_and_records_inline_actor()
     test_handler_returns_before_the_finder_and_records_who()
+    test_richer_contacts_are_context_and_email_only()
     print("hosted tests ok")

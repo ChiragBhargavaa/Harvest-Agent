@@ -12,8 +12,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import date
-from urllib.parse import urljoin, urlparse, urlsplit
+from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
 import aiohttp
@@ -34,6 +33,7 @@ except ImportError:  # pragma: no cover
 
 # ======================= hosted runtime glue (replaces common.py) =======================
 # Agentverse hosted: the global `agent` is pre-provided. No Agent(...), no agent.run(), no .env, no local files.
+agent = agent  # noqa: F821
 
 class ToolRequest(Model):
     tool: str              # "find_leads" | "find_contacts" | "qualify_leads" | "draft_emails" | "send_emails"
@@ -339,10 +339,126 @@ def extract_emails(page: Page) -> list[str]:
     return sorted(set(clean))
 
 
+def _norm_phone(raw: str) -> str | None:
+    text = re.sub(r"[\s().-]", "", str(raw or ""))
+    digits = re.sub(r"\D", "", text)
+    text = ("+" + digits) if text.startswith("+") else digits
+    if not 10 <= len(digits) <= 15:
+        return None
+    return text
+
+
+def _phones_from(*values) -> list[str]:
+    found: list[str] = []
+    for value in values:
+        parts = value if isinstance(value, (list, tuple, set)) else str(value or "").split(";")
+        for part in parts:
+            phone = _norm_phone(str(part))
+            if phone and phone not in found:
+                found.append(phone)
+    return found
+
+
+def _schema_telephones(html: str) -> list[str]:
+    found: list[str] = []
+    for blob in re.findall(
+            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html or "", re.I | re.S):
+        try:
+            data = json.loads(blob)
+        except ValueError:
+            continue
+        stack = [data]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                tel = node.get("telephone")
+                if isinstance(tel, str):
+                    found.append(tel)
+                elif isinstance(tel, list):
+                    found.extend(str(item) for item in tel if isinstance(item, (str, int)))
+                stack.extend(node.values())
+            elif isinstance(node, list):
+                stack.extend(node)
+    found.extend(re.findall(r'itemprop=["\']telephone["\'][^>]*content=["\']([^"\']+)', html or "", re.I))
+    found.extend(re.findall(r'itemprop=["\']telephone["\'][^>]*>([^<]+)', html or "", re.I))
+    return found
+
+
 def extract_phones(page: Page) -> list[str]:
-    phones = {link[4:] for link in page.links if link.lower().startswith("tel:")}
-    phones.update(m.strip() for m in PHONE_RE.findall(page.text))
-    return sorted({re.sub(r"[\s-]", "", p) for p in phones if len(re.sub(r"\D", "", p)) >= 10})
+    phones = [link[4:] for link in page.links if link.lower().startswith("tel:")]
+    phones.extend(PHONE_RE.findall(page.text))
+    phones.extend(_schema_telephones(page.html))
+    return _phones_from(phones)
+
+
+_SOCIAL_HOSTS = {
+    "instagram": ("instagram.com",),
+    "facebook": ("facebook.com", "fb.com", "m.facebook.com"),
+}
+_SOCIAL_SKIP = {
+    "instagram": {"explore", "about", "accounts", "p", "reel", "reels", "stories", "direct"},
+    "facebook": {"sharer", "share", "dialog", "plugins", "login", "watch", "marketplace", "events", "sharer.php"},
+}
+
+
+def _social_link(url: str, kind: str) -> str | None:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    if not any(host == item or host.endswith("." + item) for item in _SOCIAL_HOSTS[kind]):
+        return None
+    parts = [part for part in parsed.path.split("/") if part]
+    if not parts or parts[0].lower() in _SOCIAL_SKIP[kind]:
+        return None
+    return f"https://{host}/{parts[0]}"
+
+
+def _published_social(value, kind: str) -> str | None:
+    """A social value that was actually published. Handles stay handles; URLs stay profile URLs."""
+    raw = str(value or "").strip()
+    if not raw or any(ch.isspace() for ch in raw) or len(raw) > 200:
+        return None
+    if raw.lower().startswith(("http://", "https://")):
+        return _social_link(raw, kind)
+    handle = raw.lstrip("@").strip("/")
+    if not re.fullmatch(r"[A-Za-z0-9._]{2,30}", handle):
+        return None
+    return handle
+
+
+def _page_social(page: Page) -> dict:
+    found = {}
+    for link in page.links:
+        for kind in ("instagram", "facebook"):
+            if kind not in found and (url := _social_link(link, kind)):
+                found[kind] = url
+    return found
+
+
+def _business_channels(lead: dict, pages: list) -> dict:
+    """Phone, website, Instagram and Facebook published on the lead or its pages. Nothing is guessed."""
+    phones = _phones_from(lead.get("phone"), lead.get("phones"))
+    instagram = _published_social(lead.get("instagram") or lead.get("contact:instagram"), "instagram")
+    facebook = _published_social(lead.get("facebook") or lead.get("contact:facebook"), "facebook")
+    for page in pages or []:
+        phones = _phones_from(phones, extract_phones(page))
+        social = _page_social(page)
+        instagram = social.get("instagram") or instagram
+        facebook = social.get("facebook") or facebook
+    channels = {"phones": phones, "website": normalise_url(lead.get("website"))}
+    if instagram:
+        channels["instagram"] = instagram
+    if facebook:
+        channels["facebook"] = facebook
+    return channels
+
+
+def _with_channels(record: dict, channels: dict) -> dict:
+    merged = dict(record)
+    merged["phones"] = list(channels.get("phones") or [])
+    for key in ("website", "instagram", "facebook"):
+        if channels.get(key):
+            merged[key] = channels[key]
+    return merged
 
 
 def guess_role(email: str) -> str:
@@ -437,7 +553,7 @@ async def _contacts_for(lead: dict, fetcher, sem: asyncio.Semaphore, mx_cache: d
     """-> (contacts, skip reason if none). Never raises."""
     website = normalise_url(lead.get("website"))
     found: list[tuple[str, str, bool]] = []  # (email, source_url, on_own_site)
-    phones: set[str] = set()
+    pages: list = []
     own: set[str] = set()
     reason = None
     if not website:
@@ -453,14 +569,14 @@ async def _contacts_for(lead: dict, fetcher, sem: asyncio.Semaphore, mx_cache: d
         for page in pages:
             on_own = _same_site(domain_of(page.url), own)
             found += [(e, page.url, on_own) for e in extract_emails(page)]
-            phones.update(extract_phones(page))
-    phones.update(re.sub(r"[\s-]", "", p) for p in (lead.get("phone") or "").split(";") if p.strip())
+    channels = _business_channels(lead, pages)
 
     best: dict[str, dict] = {}
     for email, url, on_own in found:
         role, confidence = classify(email, on_own, own)
-        contact = {"lead_id": lead["id"], "email": email, "role": role, "person_name": None, "source": "website",
-                   "source_url": url, "confidence": confidence, "mx_ok": True}
+        contact = _with_channels(
+            {"lead_id": lead["id"], "email": email, "role": role, "person_name": None, "source": "website",
+             "source_url": url, "confidence": confidence, "mx_ok": True}, channels)
         prev = best.get(email)
         if prev is None or CONFIDENCE_RANK[confidence] < CONFIDENCE_RANK[prev["confidence"]]:
             best[email] = contact
@@ -468,11 +584,12 @@ async def _contacts_for(lead: dict, fetcher, sem: asyncio.Semaphore, mx_cache: d
         email = _clean_email(raw)
         if email and email not in best:  # OSM is a third-party source: low unless also on the site
             role = guess_role(email)
-            best[email] = {"lead_id": lead["id"], "email": email, "role": ROLE_MAP.get(role, role),
-                           "person_name": None, "source": "osm", "source_url": lead.get("source_ref"),
-                           "confidence": "low", "mx_ok": True}
+            best[email] = _with_channels(
+                {"lead_id": lead["id"], "email": email, "role": ROLE_MAP.get(role, role),
+                 "person_name": None, "source": "osm", "source_url": lead.get("source_ref"),
+                 "confidence": "low", "mx_ok": True}, channels)
     if not best:
-        return [], reason or "no_email_found"
+        return [], reason or "no_email_found", channels
 
     for domain in {e.split("@")[1] for e in best}:
         if domain not in mx_cache:  # one blocking DNS lookup per domain per call, off the event loop
@@ -488,11 +605,11 @@ async def _contacts_for(lead: dict, fetcher, sem: asyncio.Semaphore, mx_cache: d
         except Exception:  # noqa: BLE001 - DNS failure counts as no MX
             ok = False
         if ok is not False:
-            contacts.append(dict(contact, phones=sorted(phones)))
+            contacts.append(contact)
     if not contacts:
-        return [], "mx_failed"
+        return [], "mx_failed", channels
     contacts.sort(key=lambda c: (CONFIDENCE_RANK[c["confidence"]], ROLE_RANK.get(c["role"], 3), c["email"]))
-    return contacts, None
+    return contacts, None, channels
 
 
 async def find_contacts(args: dict) -> dict:
@@ -512,20 +629,29 @@ async def find_contacts(args: dict) -> dict:
             try:
                 return await _contacts_for(lead, fetcher, sem, mx_cache, max_pages)
             except Exception:  # noqa: BLE001 - a per-lead failure never fails the whole step
-                return [], "unreachable"
+                return [], "unreachable", _business_channels(lead, [])
 
         tasks = [asyncio.create_task(one(lead)) for lead in leads]
         _, pending = await asyncio.wait(tasks, timeout=CONTACT_BUDGET_S)
         for task in pending:  # over budget: return what we have
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
-    results = [([], "timed_out") if task in pending else task.result() for task in tasks]
+    results = [([], "timed_out", _business_channels(lead, [])) if task in pending else task.result()
+               for lead, task in zip(leads, tasks, strict=True)]
 
     contacts, skipped = [], []
-    for lead, (found, reason) in zip(leads, results, strict=True):
+    for lead, (found, reason, channels) in zip(leads, results, strict=True):
         contacts += found
         if reason and not found:
-            skipped.append({"lead_id": lead["id"], "reason": reason})
+            row = {"lead_id": lead["id"], "reason": reason}
+            alt = channels.get("phones") or channels.get("instagram") or channels.get("facebook")
+            if reason != "mx_failed" and alt:
+                row["note"] = "no email: phone/IG available"
+                row["phones"] = list(channels.get("phones") or [])
+                for key in ("website", "instagram", "facebook"):
+                    if channels.get(key):
+                        row[key] = channels[key]
+            skipped.append(row)
     log.info(f"find_contacts done in {time.monotonic() - start:.1f}s: {len(contacts)} contacts, {len(skipped)} skipped "
              f"({len(pending)} timed out)")
     return {"contacts": contacts, "skipped": skipped}
