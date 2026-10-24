@@ -1,4 +1,4 @@
-"""Orchestrator agent "leadreach": the one brands talk to inside ASI:One.
+"""Orchestrator agent "Harvest Agent": the one brands talk to inside ASI:One.
 
 Flow: ASI:One chat -> Chat Protocol -> intent (card JSON or ASI:One LLM) -> campaign state machine
       -> specialist agents via send_and_receive -> checkpoint card (approval gate) -> next step.
@@ -47,7 +47,7 @@ from common import (
 # (primary + resend + local run) <= STEP_WORST_S: the specialists cap their own work (FINDER_BUDGET_S 50 s,
 # CONTACT_BUDGET_S 50 s, ANALYST_BUDGET_S 60 s, copywriter 2 x 40 s) and the local run gets what is left.
 SPECIALISTS = {
-    "find_leads": ("LEAD_FINDER_AGENT_ADDRESS", 60),
+    "find_leads": ("LEAD_FINDER_AGENT_ADDRESS", 75),
     "find_contacts": ("CONTACT_FINDER_AGENT_ADDRESS", 60),
     "qualify_leads": ("LEAD_ANALYST_AGENT_ADDRESS", 70),
     "draft_emails": ("COPYWRITER_AGENT_ADDRESS", 60),
@@ -90,7 +90,7 @@ HELP = (
 )
 
 agent = Agent(
-    name=os.getenv("ORCH_NAME", "leadreach"),
+    name=os.getenv("ORCH_NAME", "Harvest Agent"),
     seed=require_env("ORCH_SEED"),
     port=int(os.getenv("ORCH_PORT", "8001")),
     mailbox=env_bool("MAILBOX", True),

@@ -537,25 +537,26 @@ def timeout_unit_tests():
         os.environ.pop(key, None)
         if saved is not None:
             os.environ[key] = saved
-    check(seen == {None: 60, "450": 450, "abc": 60, "0": 60},
-          f"orchestrator: find_leads wait 60 s by default, LEADREACH_TIMEOUT_FIND_LEADS overrides it ({seen})")
+    check(seen == {None: 75, "450": 450, "abc": 75, "0": 75},
+          f"orchestrator: find_leads wait 75 s by default, LEADREACH_TIMEOUT_FIND_LEADS overrides it ({seen})")
     waits = {t: d for t, (_, d) in orchestrator.SPECIALISTS.items()}
-    check(waits == {"find_leads": 60, "find_contacts": 60, "qualify_leads": 70, "draft_emails": 60, "send_emails": 30}
+    check(waits == {"find_leads": 75, "find_contacts": 60, "qualify_leads": 70, "draft_emails": 60, "send_emails": 30}
           and orchestrator.RESEND_WAIT_S == 30 and orchestrator.STEP_WORST_S == 180,
-          "orchestrator: primary waits 60/60/70/60/30 s, resend wait 30 s, step worst case 180 s")
+          "orchestrator: primary waits 75/60/70/60/30 s, resend wait 30 s, step worst case 180 s")
     check(contact_finder.CONTACT_BUDGET_S == 50 < waits["find_contacts"]
           and lead_analyst.ANALYST_BUDGET_S == 60 < waits["qualify_leads"]
-          and lead_finder.FINDER_BUDGET_S == 50 < waits["find_leads"]
+          and lead_finder.FINDER_BUDGET_S == 65 < waits["find_leads"]
           and contact_finder.MAX_PAGES == 3 and contact_finder.MX_TIMEOUT_S == 5,
-          "finder/contacts/analyst: own budgets (50/50/60 s) stay below the primary waits; 3 pages per site, 5 s MX")
+          "finder/contacts/analyst: own budgets (65/50/60 s) stay below the primary waits; 3 pages per site, 5 s MX")
     local = {"find_leads": lead_finder.FINDER_BUDGET_S, "find_contacts": contact_finder.CONTACT_BUDGET_S,
              "qualify_leads": lead_analyst.ANALYST_BUDGET_S, "draft_emails": 2 * copywriter.LLM_TIMEOUT_S, "send_emails": 1}
     check(all(waits[t] + orchestrator.RESEND_WAIT_S + local[t] <= orchestrator.STEP_WORST_S for t in waits),
           "orchestrator: every step's primary wait + resend wait + local run fits 180 s")
     check(llm.LLM_TIMEOUT_S == 20 and llm.LLM_MAX_RETRIES == 1 and lead_finder.MAX_QUERIES == 2
           and lead_finder.MAX_VERIFY == 8 and lead_finder.VERIFY_TIMEOUT_S == 10 and geo.HTTP_TIMEOUT_S == 10
-          and "[timeout:10]" in geo._overpass_query(["amenity=cafe"], [1, 2, 3, 4]),
-          "llm: 20 s per request + 1 retry; finder: 2 web searches, ≤8 sites verified, 10 s HTTP timeouts (Overpass too)")
+          and geo.OVERPASS_TIMEOUT_S == 30 and llm.WEB_SEARCH_LLM_TIMEOUT_S == 40
+          and "[timeout:25]" in geo._overpass_query(["amenity=cafe"], [1, 2, 3, 4]),
+          "llm: 20 s (web search 40 s) + 1 retry; finder: 2 web searches, ≤8 sites verified, 10 s HTTP, Overpass 30 s")
     real_client, llm._client = llm._client, None
     try:
         c = llm.client()

@@ -1,4 +1,4 @@
-# LeadReach - local B2B lead finder for brands
+# Harvest Agent (LeadReach) - local B2B lead finder for brands
 
 ![tag:innovationlab](https://img.shields.io/badge/innovationlab-3D8BD3)
 ![tag:hackathon](https://img.shields.io/badge/hackathon-5F43F1)

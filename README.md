@@ -22,7 +22,7 @@ Addresses are fixed by the seeds in `.env` (keep that file; `bash setup.sh` prin
 
 | Agent | Name | Role | Status | Address | Agentverse profile |
 |---|---|---|---|---|---|
-| Orchestrator | `leadreach` | Talks to the brand in ASI:One (Chat Protocol + Interactive Cards), builds the ideal-customer profile, runs the approval gates, edits drafts, audit log | ✅ implemented | `agent1q0nlrk0hsqgn9l85z8thxmr5tltjqxeqsmjw4zzme389dcw7zkudjq3lk23` | [profile](https://agentverse.ai/agents/details/agent1q0nlrk0hsqgn9l85z8thxmr5tltjqxeqsmjw4zzme389dcw7zkudjq3lk23/profile) |
+| Orchestrator | `Harvest Agent` | Talks to the brand in ASI:One (Chat Protocol + Interactive Cards), builds the ideal-customer profile, runs the approval gates, edits drafts, audit log | ✅ implemented | `agent1q0nlrk0hsqgn9l85z8thxmr5tltjqxeqsmjw4zzme389dcw7zkudjq3lk23` | [profile](https://agentverse.ai/agents/details/agent1q0nlrk0hsqgn9l85z8thxmr5tltjqxeqsmjw4zzme389dcw7zkudjq3lk23/profile) |
 | Lead Finder | `leadreach-finder` | Finds local businesses: OpenStreetMap + ASI:One web search, verifies websites by crawling | ✅ implemented | `agent1q06nvrv65ewr9g62te9xrhqgc7hu8kc3823rrvtttu33nsk4krek2w4cz0d` | [profile](https://agentverse.ai/agents/details/agent1q06nvrv65ewr9g62te9xrhqgc7hu8kc3823rrvtttu33nsk4krek2w4cz0d/profile) |
 | Contact Finder | `leadreach-contacts` | Published emails/phones by polite crawling + MX check, confidence + source URL per contact | ✅ implemented | `agent1qdr009c63xpzznwt07k62vxg5fzpr3kf89s65ckz0rjda2ls3s4evf2v4c8` | [profile](https://agentverse.ai/agents/details/agent1qdr009c63xpzznwt07k62vxg5fzpr3kf89s65ckz0rjda2ls3s4evf2v4c8/profile) |
 | Lead Analyst | `leadreach-analyst` | Fit score + evidence-backed hooks from each website (signals-only fallback) | ✅ implemented | `agent1qd8k32878hmz7jc4cw0cr6mv9q6eqa24xrac6cqxeg0c0kdjf4guj05wpl9` | [profile](https://agentverse.ai/agents/details/agent1qd8k32878hmz7jc4cw0cr6mv9q6eqa24xrac6cqxeg0c0kdjf4guj05wpl9/profile) |
@@ -45,7 +45,7 @@ out of scope for this submission.
 ## Architecture
 
 ```
-Brand ──ASI:One chat──▶ leadreach (orchestrator: Chat Protocol, Interactive Cards, gates, audit log)
+Brand ──ASI:One chat──▶ Harvest Agent (orchestrator: Chat Protocol, Interactive Cards, gates, audit log)
                           │  ASI:One LLM: intent → ideal-customer profile → [card: approve]
                           ├─ToolRequest─▶ leadreach-finder   OSM Nominatim + Overpass, ASI:One web search,
                           │                                  website verification            → [card: approve leads]
@@ -58,7 +58,7 @@ Brand ──ASI:One chat──▶ leadreach (orchestrator: Chat Protocol, Intera
 Fetch.ai tech: uAgents, Agentverse (mailbox + profiles), Agent Chat Protocol, ASI:One LLM (including web search), ASI
 Interactive Cards, and the Agent Payment Protocol.
 
-**Payment Protocol (optional demo):** `leadreach` is a seller (`agents/payments.py`). Say **buy lead pack** to get a
+**Payment Protocol (optional demo):** `Harvest Agent` is a seller (`agents/payments.py`). Say **buy lead pack** to get a
 `RequestPayment` (default 0.1 FET) for the verified contacts and their source URLs. A matching `CommitPayment` gets `CompletePayment`
 plus the pack; anything else gets `CancelPayment`. Verification is a labelled demo check, not on-chain. The free flow and the approval
 gates never depend on it.

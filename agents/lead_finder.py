@@ -30,8 +30,8 @@ MAX_VERIFY = 8           # LLM-suggested websites crawled per request
 VERIFY_CONCURRENCY = 8
 VERIFY_TIMEOUT_S = 10    # per website fetch
 VERIFY_RESERVE_S = 12    # budget kept free for verification after discovery
-# Whole step; the orchestrator waits 60 s, then resends once, then runs find_leads in-process (HACKATHON_README §3.6).
-FINDER_BUDGET_S = env_seconds("FINDER_BUDGET_S", 50)
+# Whole step; the orchestrator waits 75 s, then resends once, then runs find_leads in-process (HACKATHON_README §3.6).
+FINDER_BUDGET_S = env_seconds("FINDER_BUDGET_S", 65)
 # one live ASI:One web-search call takes ~30-60 s; a slower one becomes a note, not a stalled step
 WEB_SEARCH_TIMEOUT_S = float(os.getenv("LEADREACH_WEB_SEARCH_TIMEOUT", "90"))
 STOP_WORDS = {"the", "and", "cafe", "café", "restaurant", "pvt", "ltd", "private", "limited"}

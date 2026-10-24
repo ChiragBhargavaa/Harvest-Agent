@@ -217,7 +217,7 @@ Agentverse Premium: `FETCHATHONINDFETCHATHONIND`. An **AI Mentor** on the dashbo
 ### 3.5 Agents
 | Agent | File | Agentverse name | Seed env | Address env | Port | Role |
 |---|---|---|---|---|---|---|
-| Orchestrator | `agents/orchestrator.py` | `leadreach` | `ORCH_SEED` | — | 8001 | Chat protocol, cards, state machine, gates, audit log, ASI:One intent + ICP |
+| Orchestrator | `agents/orchestrator.py` | `Harvest Agent` | `ORCH_SEED` | — | 8001 | Chat protocol, cards, state machine, gates, audit log, ASI:One intent + ICP |
 | Lead Finder | `agents/lead_finder.py` | `leadreach-finder` | `FINDER_SEED` | `LEAD_FINDER_AGENT_ADDRESS` | 8002 | `find_leads`: OSM + ASI:One web search + website verification |
 | Contact Finder | `agents/contact_finder.py` | `leadreach-contacts` | `CONTACT_SEED` | `CONTACT_FINDER_AGENT_ADDRESS` | 8003 | `find_contacts`: polite crawl + extraction + MX check |
 | Lead Analyst | `agents/lead_analyst.py` | `leadreach-analyst` | `ANALYST_SEED` | `LEAD_ANALYST_AGENT_ADDRESS` | 8004 | `qualify_leads`: deterministic signals + LLM hooks |
@@ -575,9 +575,9 @@ fetcher and `mx_ok` are monkeypatched; all agents + a scripted user run in a `Bu
 ### 3.20 Out of scope and stretch
 - **Out of scope:** auto-replying, inbox OAuth, open/click tracking, scraping banned sources, guessing emails.
 - **Stretch, in order:** (1) Sender; (2) reply classification + funnel report; (3) **Payment Protocol** (§4.6) — (A) other brands buy
-  a "verified lead pack" from `leadreach` (Stripe test mode, the orchestrator as seller), or (B) agent-to-agent pay-per-verified-contact
+  a "verified lead pack" from `Harvest Agent` (Stripe test mode, the orchestrator as seller), or (B) agent-to-agent pay-per-verified-contact
   (FET testnet), which maps to "agent-to-agent payments".
-  **Status (24 Oct): (A) built as a safe demo** in `agents/payments.py` (seller role, included on `leadreach`; details in §4.6).
+  **Status (24 Oct): (A) built as a safe demo** in `agents/payments.py` (seller role, included on `Harvest Agent`; details in §4.6).
   Default price 0.1 FET (`fet_direct`) rather than Stripe; verification is a labelled DEMO check, never on-chain yet.
 
 ### 3.21 Open questions for Chirag ❓

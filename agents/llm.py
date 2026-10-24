@@ -18,6 +18,7 @@ ASI1_BASE_URL = "https://api.asi1.ai/v1"
 ASI1_MODEL = os.getenv("ASI1_MODEL", "asi1")
 # per HTTP request (the SDK default is 600 s + 2 retries, which hung a live find_leads for >10 min)
 LLM_TIMEOUT_S = env_seconds("LEADREACH_LLM_TIMEOUT", 20)
+WEB_SEARCH_LLM_TIMEOUT_S = env_seconds("LEADREACH_WEB_SEARCH_LLM_TIMEOUT", 40)  # live web search takes 20-40 s
 LLM_MAX_RETRIES = 1
 
 _client: AsyncOpenAI | None = None
@@ -38,6 +39,7 @@ async def complete(messages: list[dict], max_tokens: int = 1024, temperature: fl
     extra = {}
     if web_search and env_bool("ASI1_WEB_SEARCH", True):
         extra["web_search_options"] = {"search_context_size": os.getenv("ASI1_SEARCH_CONTEXT", "medium")}
+        extra["timeout"] = WEB_SEARCH_LLM_TIMEOUT_S  # per-request override of the 20 s client default
 
     async def _call():
         r = await client().chat.completions.create(
