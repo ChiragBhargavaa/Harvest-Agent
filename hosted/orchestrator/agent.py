@@ -2052,17 +2052,8 @@ async def _remote(ctx: Context, tool: str, args: dict, address: str):
     return None, "timeout", True
 
 
-async def call_tool(ctx: Context, tool: str, args: dict) -> tuple[dict | None, str]:
-    env_name = SPECIALISTS[tool][0]
-    address = os.getenv(env_name, "").strip()
+async def _inline_tool(ctx: Context, tool: str, args: dict) -> tuple[dict | None, str]:
     name = SPECIALIST_NAMES[tool]
-    if address:
-        result, error, timed_out = await _remote(ctx, tool, args, address)
-        if not timed_out:
-            return result, error
-        ctx.logger.warning(f"fallback: inline {tool} (remote timed out)")
-    else:
-        ctx.logger.info(f"fallback: inline {tool} (no {env_name})")
     limit = inline_budget(tool) + 5
     try:
         raw = await asyncio.wait_for(INLINE[tool](json.loads(json.dumps(args)), ctx), limit)
@@ -2072,6 +2063,42 @@ async def call_tool(ctx: Context, tool: str, args: dict) -> tuple[dict | None, s
             f"{type(err).__name__}: {err}")[:200]
         ctx.logger.error(f"fallback: inline {tool} failed: {why}")
         return None, f"{name} timed out (inline run: {why})" if isinstance(err, asyncio.TimeoutError) else why
+
+
+async def call_tool(ctx: Context, tool: str, args: dict) -> tuple[dict | None, str]:
+    # Sending is hard-coded dry-run. The hosted sender replies that send_emails is not
+    # implemented, so this step never calls it.
+    if tool == "send_emails":
+        ctx.logger.info("send_emails uses the inline dry run; the remote sender is not called")
+        return await _inline_tool(ctx, tool, args)
+    env_name = SPECIALISTS[tool][0]
+    address = os.getenv(env_name, "").strip()
+    if address:
+        result, error, timed_out = await _remote(ctx, tool, args, address)
+        if not timed_out:
+            return result, error
+        ctx.logger.warning(f"fallback: inline {tool} (remote timed out)")
+    else:
+        ctx.logger.info(f"fallback: inline {tool} (no {env_name})")
+    return await _inline_tool(ctx, tool, args)
+
+
+def dry_run_summary(camp: dict) -> str:
+    """User-facing record of a dry run. No error wording."""
+    names = {lead.get("id"): lead.get("name") or lead.get("id") for lead in camp.get("leads") or []}
+    redirect = os.getenv("TEST_REDIRECT_TO", "").strip()
+    lines = ["**Dry run, nothing was sent**", ""]
+    for draft in camp.get("drafts") or []:
+        if not draft.get("approved"):
+            continue
+        business = names.get(draft.get("lead_id")) or draft.get("lead_id") or "Unknown business"
+        subject = draft.get("subject") or "(no subject)"
+        recipient = f"TEST_REDIRECT_TO {redirect}" if redirect else (draft.get("to") or "(no email)")
+        lines.append(f"- {business} — {recipient} — {subject}")
+    if len(lines) == 2:
+        lines.append("- No approved drafts to record.")
+    lines += ["", "No email went out. Real sending is off for the demo."]
+    return "\n".join(lines)
 
 
 def _host(url: str | None) -> str:
@@ -2215,8 +2242,13 @@ async def run_from(ctx: Context, sender: str, camp: dict, gate: str) -> None:
         else:
             camp["state"] = GATE_STATES[gate][0]
             save(ctx, sender, camp)
-            await ctx.send(sender, chat_text(PROGRESS[gate]))
+            if gate != "send":
+                await ctx.send(sender, chat_text(PROGRESS[gate]))
             result, error = await call_tool(ctx, GATE_TOOL[gate], step_args(gate, camp))
+            if gate == "send" and result is None:
+                # A remote "not implemented" reply must not reach the user. Record the dry run here.
+                ctx.logger.info("send step returned no result; recording the inline dry run instead")
+                result, error = await _inline_tool(ctx, "send_emails", step_args(gate, camp))
             if result is None:
                 camp["state"], camp["failed_gate"] = STEP_FAILED, gate
                 audit(camp, gate, "failed", "system", error)
@@ -2230,6 +2262,11 @@ async def run_from(ctx: Context, sender: str, camp: dict, gate: str) -> None:
                 log_draft_skips(ctx, result)
             count = store_result(gate, camp, result)
             audit(camp, gate, f"produced {count}", "system")
+            if gate == "send":
+                camp["state"] = DONE
+                audit(camp, "send", "dry run recorded", "system")
+                await ctx.send(sender, chat_text(dry_run_summary(camp), end_session=True))
+                return
             if gate in ("leads", "drafts") and count == 0:
                 camp["state"] = GATE_STATES[gate][1]
                 await ctx.send(sender, chat_text(
