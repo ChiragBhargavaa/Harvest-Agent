@@ -16,7 +16,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "agents"))
 
 from uagents import Protocol  # noqa: E402
-from uagents_core.contrib.protocols.chat import ChatMessage, MetadataContent, TextContent  # noqa: E402
+from uagents_core.contrib.protocols.chat import (  # noqa: E402
+    ChatMessage,
+    EndSessionContent,
+    MetadataContent,
+    TextContent,
+)
 from uagents_core.contrib.protocols.payment import payment_protocol_spec  # noqa: E402
 from uagents_core.models import Model  # noqa: E402
 
@@ -444,6 +449,7 @@ def test_remote_sender_not_implemented_still_dry_runs():
     ctx = FakeCtx()
     os.environ["SENDER_AGENT_ADDRESS"] = "agent1qsender"
     os.environ.pop("TEST_REDIRECT_TO", None)
+    os.environ.pop("LEADPACK_PRICE", None)
 
     async def remote(destination, message, response_type=None, timeout=30):
         ctx.remote_calls += 1
@@ -492,6 +498,73 @@ def test_remote_sender_not_implemented_still_dry_runs():
     assert outbox[0]["to"] == "owner@brew.test"
     assert outbox[0]["subject"] == "Hello from the roaster"
     assert outbox[0]["dry_run"] is True
+    assert "Buy lead pack" not in joined
+    assert any(
+        isinstance(part, EndSessionContent)
+        for _, msg in ctx.sent if isinstance(msg, ChatMessage) for part in msg.content
+    )
+
+
+def test_priced_dry_run_offers_buy_button():
+    """LEADPACK_PRICE adds a buy button after the summary. Unset has no button (covered above)."""
+    ctx = FakeCtx()
+    os.environ["LEADPACK_PRICE"] = "0.25"
+    os.environ.pop("LEADPACK_RECIPIENT", None)
+    os.environ.pop("TEST_REDIRECT_TO", None)
+    camp = mod.fresh_campaign()
+    camp["state"] = mod.AWAIT_DRAFTS
+    camp["campaign_id"] = "camp-buy"
+    camp["target"]["city"] = "Jaipur"
+    camp["leads"] = [{"id": "web:brew", "name": "Brew Lab", "website": "https://brew.test"}]
+    camp["contacts"] = [{
+        "lead_id": "web:brew", "email": "owner@brew.test", "role": "owner",
+        "source_url": "https://brew.test",
+    }]
+    camp["drafts"] = [{
+        "lead_id": "web:brew", "to": "owner@brew.test", "subject": "Hello",
+        "body_text": "Hi there", "approved": False,
+    }]
+    camp["draft_cursor"] = 0
+    ctx.storage.set(mod.storage_key(SENDER), camp)
+    try:
+        async def run():
+            await mod.handle_chat(ctx, SENDER, chat("approve"))
+            cards = [msg for _, msg in ctx.sent if _card_payload(msg)]
+            assert len(cards) == 1
+            payload = _card_payload(cards[0])
+            assert payload["ctas"][0]["label"] == "Buy lead pack (0.25 FET, demo)"
+            assert payload["ctas"][0]["selection"]["action"] == "buy_lead_pack"
+            shown = texts(ctx)
+            summary_at = next(i for i, item in enumerate(shown) if "Dry run, nothing was sent" in item)
+            button_at = next(i for i, item in enumerate(shown) if "Buy lead pack (0.25 FET, demo)" in item)
+            assert summary_at < button_at
+            assert not any(
+                isinstance(part, EndSessionContent)
+                for _, msg in ctx.sent if isinstance(msg, ChatMessage) for part in msg.content
+            )
+            saved = ctx.storage.get(mod.storage_key(SENDER))
+            assert saved["drafts"][0]["body_text"] == "Hi there"
+            assert "0.25" not in saved["drafts"][0]["body_text"]
+            await mod.handle_chat(ctx, SENDER, chat(json.dumps({"action": "buy_lead_pack", "step": "send"})))
+
+        asyncio.run(run())
+    finally:
+        os.environ.pop("LEADPACK_PRICE", None)
+
+    request = next(msg for _, msg in ctx.sent if type(msg).__name__ == "RequestPayment")
+    assert request.accepted_funds[0].amount == "0.25"
+    assert request.accepted_funds[0].currency == "FET"
+    assert request.recipient == "fetch1" + "q" * 50
+    assert request.description.startswith("Harvest Agent lead pack")
+    simulate = None
+    for _, msg in ctx.sent:
+        payload = _card_payload(msg)
+        if payload and payload["ctas"][0]["label"] == "Simulate payment (demo)":
+            simulate = payload
+    assert simulate is not None
+    values = " ".join(row["value"] for row in simulate["summary_rows"])
+    assert "0.25 FET" in values
+    assert "Demo only, no real funds move" in values
 
 
 def _nominatim_body():
@@ -862,6 +935,7 @@ if __name__ == "__main__":
     test_contacts_reviews_drafts_and_unpriced_pack()
     test_remote_success_skips_inline()
     test_remote_sender_not_implemented_still_dry_runs()
+    test_priced_dry_run_offers_buy_button()
     test_overpass_failover_and_partial_website_lookup()
     test_finder_overpass_mirrors()
     test_lead_pack_card_survives_bounced_request_and_simulates()

@@ -1941,6 +1941,19 @@ def lead_pack_card(req: RequestPayment) -> ChatMessage:
     return detail_card("Harvest Agent lead pack", rows, ctas, narration)
 
 
+def buy_pack_card(price: str) -> ChatMessage:
+    """Offered after the dry-run summary. The button starts the lead-pack card flow."""
+    label = f"Buy lead pack ({price} FET, demo)"
+    rows = [{"label": "Price", "value": f"{price} FET, demo"}]
+    ctas = [{
+        "label": label,
+        "selection": {"action": "buy_lead_pack", "step": "send"},
+        "primary": True,
+    }]
+    narration = f"Want the **Harvest Agent lead pack**? {label}.\n\nDemo only, no real funds move."
+    return detail_card("Harvest Agent lead pack", rows, ctas, narration)
+
+
 async def _safe_send(ctx: Context, to: str, msg) -> None:
     try:
         await ctx.send(to, msg)
@@ -2435,7 +2448,12 @@ async def run_from(ctx: Context, sender: str, camp: dict, gate: str) -> None:
             if gate == "send":
                 camp["state"] = DONE
                 audit(camp, "send", "dry run recorded", "system")
-                await ctx.send(sender, chat_text(dry_run_summary(camp), end_session=True))
+                price = leadpack_amount()
+                if price:
+                    await ctx.send(sender, chat_text(dry_run_summary(camp)))
+                    await ctx.send(sender, buy_pack_card(price))
+                else:
+                    await ctx.send(sender, chat_text(dry_run_summary(camp), end_session=True))
                 return
             if gate in ("leads", "drafts") and count == 0:
                 camp["state"] = GATE_STATES[gate][1]
