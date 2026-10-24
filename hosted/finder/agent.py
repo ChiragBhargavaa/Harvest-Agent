@@ -1,7 +1,8 @@
 """leadreach-finder - Agentverse HOSTED port of LeadReach / Harvest Agent agents/lead_finder.py.
 
 Single self-contained file. Uses the pre-provided global `agent` (do not construct Agent or call run()).
-Secrets (Agentverse -> agent -> Secrets): ASI1_API_KEY (required); optional FINDER_BUDGET_S, LEADREACH_WEB_SEARCH_TIMEOUT, REPLY_TO, ASI1_MODEL
+Secrets (Agentverse -> agent -> Secrets): ASI1_API_KEY (required); optional FINDER_BUDGET_S,
+LEADREACH_WEB_SEARCH_TIMEOUT, REPLY_TO, ASI1_MODEL
 Protocol: leadreach-tools 0.1.0, ToolRequest -> ToolResponse (identical to the local agents, same digest).
 """
 
@@ -12,7 +13,6 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import date
 from urllib.parse import urljoin, urlparse, urlsplit
 from urllib.robotparser import RobotFileParser
 
@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover
 
 # ======================= hosted runtime glue (replaces common.py) =======================
 # Agentverse hosted: the global `agent` is pre-provided. No Agent(...), no agent.run(), no .env, no local files.
+agent = agent  # noqa: F821
 
 class ToolRequest(Model):
     tool: str              # "find_leads" | "find_contacts" | "qualify_leads" | "draft_emails" | "send_emails"
@@ -381,10 +382,22 @@ def name_matches(name: str, page: Page) -> bool:
 
 # ======================= geo.py =======================
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-OVERPASS_URLS = ("https://overpass-api.de/api/interpreter", "https://overpass.private.coffee/api/interpreter")
+OVERPASS_URLS = (
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+)
 GEO_CACHE_TTL_S = 24 * 3600
 GEO_HTTP_TIMEOUT_S = 10  # per request; the lead finder has a 65 s budget for the whole step
-OVERPASS_TIMEOUT_S = 30  # Overpass is slow under load; 10 s returned nothing live
+OVERPASS_HTTP_TIMEOUT_S = 9  # client timeout per try (8-10s); the query itself asks Overpass for 8s
+OVERPASS_QUERY_TIMEOUT = 8
+OVERPASS_OUT_LIMIT = 40
+
+
+def osm_user_agent() -> str:
+    reply = os.getenv("REPLY_TO", "").strip()
+    contact = f"+mailto:{reply}" if reply else "+https://github.com/ChiragBhargavaa/Harvest-Agent"
+    return f"LeadReachBot/0.1 ({contact})"
 _geo_cache: dict[str, tuple[float, object]] = {}
 _geo_lock = asyncio.Lock()  # one OSM request at a time from this process
 
@@ -422,7 +435,7 @@ async def geocode(city: str, country: str = "India") -> dict:
     key = f"geo:{city.lower()}:{country.lower()}"
     if (hit := _geo_cached(key)) is not None:
         return hit
-    async with _geo_lock, aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as s:
+    async with _geo_lock, aiohttp.ClientSession(headers={"User-Agent": osm_user_agent()}) as s:
         params = {"q": f"{city}, {country}", "format": "json", "limit": 1}
         async with s.get(NOMINATIM_URL, params=params, timeout=aiohttp.ClientTimeout(total=GEO_HTTP_TIMEOUT_S)) as r:
             r.raise_for_status()
@@ -438,36 +451,64 @@ async def geocode(city: str, country: str = "India") -> dict:
 
 
 def _overpass_query(tags: list[str], bbox: list[float]) -> str:
-    s, n, w, e = bbox
-    parts = "".join(f'nwr["{k}"="{v}"]["name"]({s},{w},{n},{e});' for k, v in (t.split("=", 1) for t in tags))
-    return f"[out:json][timeout:{OVERPASS_TIMEOUT_S - 5}];({parts});out center tags;"
+    """Small bbox query: at most 4 tag filters and 40 named elements, server timeout 8s."""
+    south, north, west, east = bbox
+    parts = "".join(
+        f'nwr["{key}"="{value}"]["name"]({south},{west},{north},{east});'
+        for key, value in (item.split("=", 1) for item in list(tags)[:4])
+    )
+    return f"[out:json][timeout:{OVERPASS_QUERY_TIMEOUT}];({parts});out center tags {OVERPASS_OUT_LIMIT};"
 
 
-async def find_businesses(tags: list[str], bbox: list[float]) -> list[dict]:
-    """-> list of lead dicts (source="osm") with whatever contact tags OSM has."""
+async def find_businesses(tags: list[str], bbox: list[float], deadline: float | None = None) -> list[dict]:
+    """-> list of lead dicts (source="osm") with whatever contact tags OSM has.
+
+    Mirrors are tried in order. Each mirror gets one quick retry. Stops when `deadline` is near
+    so a dead endpoint cannot consume the finder budget.
+    """
     if not tags:
         return []
     query = _overpass_query(tags, bbox)
     if (hit := _geo_cached(query)) is not None:
         return hit
-    data, last_err = None, None
-    async with _geo_lock, aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as s:
+    data, last_err, served = None, None, None
+    per_try = min(10.0, env_seconds("LEADREACH_OVERPASS_TIMEOUT", OVERPASS_HTTP_TIMEOUT_S))
+    pause = env_seconds("LEADREACH_OVERPASS_RETRY_PAUSE", 0.4)
+    async with _geo_lock, aiohttp.ClientSession(headers={"User-Agent": osm_user_agent()}) as session:
         for url in OVERPASS_URLS:
-            try:
-                async with s.post(url, data={"data": query}, timeout=aiohttp.ClientTimeout(total=OVERPASS_TIMEOUT_S)) as r:
-                    if r.status in (429, 504):
-                        last_err = RuntimeError(f"Overpass busy ({r.status})")
-                        await asyncio.sleep(30)
-                        continue
-                    r.raise_for_status()
-                    data = await r.json(content_type=None)
+            for attempt in (1, 2):
+                if deadline is not None and time.monotonic() >= deadline - 0.5:
+                    last_err = TimeoutError("finder budget")
                     break
-            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-                last_err = err
+                timeout = per_try if deadline is None else min(per_try, max(1.0, deadline - time.monotonic()))
+                try:
+                    async with session.post(
+                        url, data={"data": query}, timeout=aiohttp.ClientTimeout(total=timeout)
+                    ) as response:
+                        if response.status in (429, 500, 502, 503, 504):
+                            last_err = RuntimeError(f"Overpass busy ({response.status})")
+                        elif response.status >= 400:
+                            last_err = RuntimeError(f"Overpass HTTP {response.status}")
+                            break
+                        else:
+                            data = await response.json(content_type=None)
+                            served = urlsplit(url).hostname or url
+                            break
+                except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                    last_err = err
+                if data is not None:
+                    break
+                if attempt == 1 and (deadline is None or time.monotonic() + 0.05 < deadline):
+                    remaining = pause if deadline is None else min(pause, deadline - time.monotonic())
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+                    continue
+            if data is not None or (deadline is not None and time.monotonic() >= deadline - 0.5):
+                break
     if data is None:
         raise RuntimeError(f"OpenStreetMap Overpass unavailable: {last_err}")
-    leads = [_to_lead(el) for el in data.get("elements", [])]
-    leads = [lead for lead in leads if lead]
+    leads = [lead for lead in (_to_lead(el) for el in data.get("elements", [])) if lead]
+    logging.getLogger("leadreach-finder").info(f"Overpass served by {served} ({len(leads)} businesses)")
     _geo_cache[query] = (time.time(), leads)
     return leads
 
@@ -840,11 +881,12 @@ async def _discover_all(icp: dict, queries: list[str], limit: float) -> list:
 async def _osm(icp: dict, city: str, limit: float, notes: list[str]) -> tuple[dict, list[dict]]:
     """-> (place, OSM leads). Never raises: a failed or slow lookup becomes a note."""
     place = {"name": city, "bbox": None}
+    deadline = time.monotonic() + limit
     try:
         async def lookup():
             found = await geocode(city)
             tags = tags_for(icp.get("business_types", []), icp.get("osm_tags"))
-            return found, tags, await find_businesses(tags, found["bbox"])
+            return found, tags, await find_businesses(tags, found["bbox"], deadline=deadline)
 
         place, tags, osm = await asyncio.wait_for(lookup(), limit)
         notes.append(f"OpenStreetMap: {len(osm)} businesses for {', '.join(tags) or 'no tags'}; "
@@ -890,6 +932,39 @@ async def _verify_websites(leads: list[dict], notes: list[str], limit: float) ->
     notes.append(f"Web search suggested {len(todo)} websites; {verified} verified by crawling"
                  + (f", {len(unchecked)} unverified (time budget)." if unchecked else "."))
     return len(todo) - len(unchecked)
+
+
+def lookup_cap() -> float:
+    """Website lookup must not consume the whole finder budget."""
+    return min(8.0, env_seconds("LEADREACH_LOOKUP_CAP", 8))
+
+
+async def _lookup_websites(missing: list[dict], city: str, limit: float) -> tuple[dict[str, str], int]:
+    """Parallel batches. A slow batch is cancelled; websites from finished batches are kept."""
+    cap = min(limit, lookup_cap())
+    if cap < 0.2 or not missing:
+        return {}, 0
+    batches = [missing[i:i + 3] for i in range(0, min(len(missing), 9), 3)]
+
+    async def one(batch: list[dict]) -> dict[str, str]:
+        return await asyncio.wait_for(find_websites(batch, city), cap)
+
+    tasks = [asyncio.create_task(one(batch)) for batch in batches]
+    done, pending = await asyncio.wait(tasks, timeout=cap)
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    found: dict[str, str] = {}
+    for task in done:
+        if task.cancelled():
+            continue
+        try:
+            result = task.result()
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(result, dict):
+            found.update(result)
+    return found, len(pending)
 
 
 async def find_leads(args: dict) -> dict:
@@ -956,18 +1031,18 @@ async def find_leads(args: dict) -> dict:
     shortlist = leads[: limit * 2]
 
     # 3. Find official websites for promising leads that have none (batch web search)
-    missing = [lead for lead in shortlist if not lead.get("website")][:10]
+    missing = [lead for lead in shortlist if not lead.get("website")][:9]
     lookup_left = _left(deadline, VERIFY_RESERVE_S)
-    if missing and lookup_left > 1:  # one batch call, only while the budget allows
-        lookup_limit = min(WEB_SEARCH_TIMEOUT_S, lookup_left)
-        try:
-            found = await asyncio.wait_for(find_websites(missing, city), lookup_limit)
-            for lead in missing:
-                url = normalise_url(found.get(lead["id"]))
-                if url and not is_banned(url):
-                    lead["website"], lead["website_source"] = url, "web_candidate"
-        except Exception as err:  # noqa: BLE001
-            notes.append(f"Website lookup failed: {_why(err, lookup_limit)}")
+    if missing and lookup_left > 1:
+        found, unfinished = await _lookup_websites(missing, city, lookup_left)
+        applied = 0
+        for lead in missing:
+            url = normalise_url(found.get(lead["id"]))
+            if url and not is_banned(url):
+                lead["website"], lead["website_source"] = url, "web_candidate"
+                applied += 1
+        if unfinished:
+            notes.append(f"Website lookup kept {applied} result(s); {unfinished} batch(es) ran out of time.")
     elif missing:
         notes.append("Website lookup skipped (time budget).")
 

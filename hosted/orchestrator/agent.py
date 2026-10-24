@@ -116,7 +116,13 @@ FAKE_EMAIL_HINTS = ("example.", "yourdomain", "domain.com", "email.com", "sentry
 FREEMAIL = ("gmail.com", "yahoo.com", "yahoo.co.in", "hotmail.com", "outlook.com", "rediffmail.com", "icloud.com")
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-OVERPASS_URLS = ("https://overpass-api.de/api/interpreter", "https://overpass.private.coffee/api/interpreter")
+OVERPASS_URLS = (
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+)
+OVERPASS_QUERY_TIMEOUT = 8
+OVERPASS_OUT_LIMIT = 40
 OSM_TAGS = {
     "cafe": ["amenity=cafe"], "coffee shop": ["amenity=cafe"], "restaurant": ["amenity=restaurant"],
     "bakery": ["shop=bakery"], "bar": ["amenity=bar", "amenity=pub"], "hotel": ["tourism=hotel"],
@@ -142,7 +148,8 @@ def ist_today() -> str:
 
 def user_agent() -> str:
     reply = os.getenv("REPLY_TO", "").strip()
-    return f"LeadReachBot/0.1 (+mailto:{reply})" if reply else "LeadReachBot/0.1"
+    contact = f"+mailto:{reply}" if reply else "+https://github.com/ChiragBhargavaa/Harvest-Agent"
+    return f"LeadReachBot/0.1 ({contact})"
 
 
 def env_bool(name: str, default: bool = True) -> bool:
@@ -947,13 +954,14 @@ async def geocode(city: str, ctx=None, lock: asyncio.Lock | None = None, country
     return result
 
 
-def _overpass_query(tags: list[str], bbox: list, timeout_s: int) -> str:
+def _overpass_query(tags: list[str], bbox: list) -> str:
+    """Small bbox query: at most 4 tag filters and 40 named elements, server timeout 8s."""
     south, north, west, east = bbox
     parts = "".join(
         f'nwr["{key}"="{value}"]["name"]({south},{west},{north},{east});'
-        for key, value in (item.split("=", 1) for item in tags)
+        for key, value in (item.split("=", 1) for item in list(tags)[:4])
     )
-    return f"[out:json][timeout:{max(1, timeout_s - 5)}];({parts});out center tags;"
+    return f"[out:json][timeout:{OVERPASS_QUERY_TIMEOUT}];({parts});out center tags {OVERPASS_OUT_LIMIT};"
 
 
 def _to_lead(el: dict) -> dict | None:
@@ -982,35 +990,52 @@ def _to_lead(el: dict) -> dict | None:
     }
 
 
-async def find_businesses(tags: list[str], bbox: list, ctx=None, lock: asyncio.Lock | None = None) -> list[dict]:
+async def find_businesses(tags: list[str], bbox: list, ctx=None, lock: asyncio.Lock | None = None,
+                          deadline: float | None = None) -> list[dict]:
+    """Try Overpass mirrors in order. Each mirror gets one quick retry. Stops at `deadline`."""
     if not tags:
         return []
-    timeout_s = int(env_seconds("LEADREACH_OVERPASS_TIMEOUT", 12))
-    query = _overpass_query(tags, bbox, timeout_s)
+    query = _overpass_query(tags, bbox)
     box = _cache_box(ctx)
     if (hit := _cache_get(box, query)) is not None:
         return hit
     if lock is None:
         lock = asyncio.Lock()
-    data, last_err = None, None
+    per_try = min(10.0, env_seconds("LEADREACH_OVERPASS_TIMEOUT", 9))
+    pause = env_seconds("LEADREACH_OVERPASS_RETRY_PAUSE", 0.4)
+    data, last_err, served = None, None, None
+    headers = {"User-Agent": user_agent()}
     async with lock:
         for url in OVERPASS_URLS:
-            try:
-                res = await http_request("POST", url, data={"data": query}, headers={"User-Agent": user_agent()},
-                                        timeout=timeout_s)
-                if res["status"] in (429, 504):
-                    last_err = RuntimeError(f"Overpass busy ({res['status']})")
-                    continue  # no 30s sleep: a hosted turn has to return a partial result
-                if res["status"] >= 400:
+            for attempt in (1, 2):
+                if deadline is not None and time.monotonic() >= deadline - 0.5:
+                    last_err = TimeoutError("finder budget")
+                    break
+                timeout = per_try if deadline is None else min(per_try, max(1.0, deadline - time.monotonic()))
+                try:
+                    res = await http_request("POST", url, data={"data": query}, headers=headers, timeout=timeout)
+                except Exception as err:  # noqa: BLE001
+                    last_err = err
+                    res = None
+                if res is not None and res["status"] < 400:
+                    data = response_json(res)
+                    served = urlsplit(url).hostname or url
+                    break
+                if res is not None:
                     last_err = RuntimeError(f"Overpass HTTP {res['status']}")
+                    if res["status"] not in (429, 500, 502, 503, 504):
+                        break
+                if attempt == 1 and (deadline is None or time.monotonic() + 0.05 < deadline):
+                    remaining = pause if deadline is None else min(pause, deadline - time.monotonic())
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
                     continue
-                data = response_json(res)
+            if data is not None or (deadline is not None and time.monotonic() >= deadline - 0.5):
                 break
-            except Exception as err:  # noqa: BLE001
-                last_err = err
     if data is None:
         raise RuntimeError(f"OpenStreetMap Overpass unavailable: {last_err}")
-    leads = [lead for lead in (_to_lead(el) for el in data.get("elements", [])) if lead]
+    leads = [lead for lead in (_to_lead(el) for el in (data or {}).get("elements", [])) if lead]
+    log.info(f"Overpass served by {served} ({len(leads)} businesses)")
     _cache_put(ctx, box, query, leads)
     return leads
 # ---------- find_leads ----------
@@ -1088,11 +1113,12 @@ async def _discover_all(icp: dict, queries: list[str], limit: float) -> list:
 async def _osm(icp: dict, city: str, limit: float, notes: list[str], ctx) -> tuple[dict, list]:
     place = {"name": city, "bbox": None}
     lock = asyncio.Lock()
+    deadline = time.monotonic() + limit
     try:
         async def lookup():
             found = await geocode(city, ctx, lock)
             tags = tags_for(icp.get("business_types", []), icp.get("osm_tags"))
-            return found, tags, await find_businesses(tags, found["bbox"], ctx, lock)
+            return found, tags, await find_businesses(tags, found["bbox"], ctx, lock, deadline=deadline)
 
         place, tags, osm = await asyncio.wait_for(lookup(), limit)
         notes.append(f"OpenStreetMap: {len(osm)} businesses for {', '.join(tags) or 'no tags'}; "
@@ -1136,6 +1162,40 @@ async def _verify_websites(leads: list[dict], notes: list[str], limit: float) ->
     notes.append(f"Web search suggested {len(todo)} websites; {verified} verified by crawling"
                  + (f", {len(unchecked)} unverified (time budget)." if unchecked else "."))
     return len(todo) - len(unchecked)
+
+
+def lookup_cap() -> float:
+    """Website lookup must not consume the whole finder budget."""
+    return min(8.0, env_seconds("LEADREACH_LOOKUP_CAP", 8))
+
+
+async def _lookup_websites(missing: list[dict], city: str, limit: float) -> tuple[dict, int]:
+    """Parallel batches. A slow batch is cancelled; websites from finished batches are kept.
+    -> (lead_id -> url, number of batches that did not finish)."""
+    cap = min(limit, lookup_cap())
+    if cap < 0.2 or not missing:
+        return {}, 0
+    batches = [missing[i:i + 3] for i in range(0, min(len(missing), 9), 3)]
+
+    async def one(batch: list[dict]) -> dict:
+        return await asyncio.wait_for(find_websites(batch, city), cap)
+
+    tasks = [asyncio.create_task(one(batch)) for batch in batches]
+    done, pending = await asyncio.wait(tasks, timeout=cap)
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    found: dict = {}
+    for task in done:
+        if task.cancelled():
+            continue
+        try:
+            result = task.result()
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(result, dict):
+            found.update(result)
+    return found, len(pending)
 
 
 async def find_leads(args: dict, ctx=None) -> dict:
@@ -1198,18 +1258,18 @@ async def find_leads(args: dict, ctx=None) -> dict:
     leads = [lead for lead in by_name.values() if lead["id"] not in exclude]
     leads.sort(key=_rank, reverse=True)
     shortlist = leads[: limit * 2]
-    missing = [lead for lead in shortlist if not lead.get("website")][:10]
+    missing = [lead for lead in shortlist if not lead.get("website")][:9]
     lookup_left = _left(deadline, VERIFY_RESERVE_S)
     if missing and lookup_left > 1:
-        lookup_limit = min(env_seconds("LEADREACH_WEB_SEARCH_TIMEOUT", 20), lookup_left)
-        try:
-            found = await asyncio.wait_for(find_websites(missing, city), lookup_limit)
-            for lead in missing:
-                url = normalise_url(found.get(lead["id"]))
-                if url and not is_banned(url):
-                    lead["website"], lead["website_source"] = url, "web_candidate"
-        except Exception as err:  # noqa: BLE001
-            notes.append(f"Website lookup failed: {_why(err, lookup_limit)}")
+        found, unfinished = await _lookup_websites(missing, city, lookup_left)
+        applied = 0
+        for lead in missing:
+            url = normalise_url(found.get(lead["id"]))
+            if url and not is_banned(url):
+                lead["website"], lead["website_source"] = url, "web_candidate"
+                applied += 1
+        if unfinished:
+            notes.append(f"Website lookup kept {applied} result(s); {unfinished} batch(es) ran out of time.")
     elif missing:
         notes.append("Website lookup skipped (time budget).")
     await _verify_websites(shortlist, notes, _left(deadline))
@@ -1851,9 +1911,27 @@ def lead_pack_request(ctx: Context, camp: dict) -> RequestPayment:
         accepted_funds=[Funds(amount=amount, currency=currency, payment_method=method)],
         recipient=wallet_address(ctx), deadline_seconds=DEADLINE_S,
         reference=f"leadpack-{camp.get('campaign_id') or 'none'}-{uuid4().hex[:8]}",
-        description=f"LeadReach verified lead pack: {len(camp.get('contacts', []))} published contacts in {city}",
-        metadata={"product": "verified_lead_pack", "verification": "DEMO, dry run"},
+        description=f"Harvest Agent lead pack: {len(camp.get('contacts', []))} published contacts in {city}",
+        metadata={"product": "lead_pack", "verification": "DEMO, dry run"},
     )
+
+
+def lead_pack_card(req: RequestPayment) -> ChatMessage:
+    """Chat card with the payment details. Sent before the RequestPayment envelope."""
+    funds = req.accepted_funds[0]
+    rows = [
+        {"label": "Amount", "value": f"{funds.amount} {funds.currency}"},
+        {"label": "Recipient", "value": req.recipient or "-"},
+        {"label": "Reference", "value": req.reference or "-"},
+        {"label": "Verification", "value": "Demo only, no real funds move"},
+    ]
+    ctas = [{
+        "label": "Simulate payment (demo)",
+        "selection": {"action": "simulate_payment", "step": "payment"},
+        "primary": True,
+    }]
+    narration = f"**Harvest Agent lead pack**\n{_numbered(rows)}\n\nDemo only, no real funds move."
+    return detail_card("Harvest Agent lead pack", rows, ctas, narration)
 
 
 async def _safe_send(ctx: Context, to: str, msg) -> None:
@@ -1876,7 +1954,7 @@ async def offer(ctx: Context, sender: str, camp: dict) -> None:
     try:
         if not leadpack_amount():
             await ctx.send(sender, chat_text(
-                "A verified lead pack isn't offered on this demo until LEADPACK_PRICE is set in Agentverse secrets. "
+                "A Harvest Agent lead pack isn't offered on this demo until LEADPACK_PRICE is set in Agentverse secrets. "
                 "Your campaign is unchanged."))
             return
         if not camp.get("contacts"):
@@ -1884,22 +1962,22 @@ async def offer(ctx: Context, sender: str, camp: dict) -> None:
                 "The lead pack is offered once leads and contacts are ready — finish the contacts step first."))
             return
         req = lead_pack_request(ctx, camp)
+        funds = req.accepted_funds[0]
         ctx.storage.set(_pending_key(sender), {
-            "reference": req.reference, "amount": req.accepted_funds[0].amount,
-            "currency": req.accepted_funds[0].currency, "recipient": req.recipient,
+            "reference": req.reference, "amount": funds.amount,
+            "currency": funds.currency, "recipient": req.recipient,
+            "payment_method": funds.payment_method,
         })
         audit(camp, "payment", "requested", "system",
-              f"{req.reference} {req.accepted_funds[0].amount} {req.accepted_funds[0].currency}")
-        funds = req.accepted_funds[0]
-        await ctx.send(sender, chat_text(
-            f"💳 **Verified lead pack**: {req.description}, with source URLs, for **{funds.amount} {funds.currency}**. "
-            f"I've sent a payment request (ref `{req.reference}`, valid {DEADLINE_S // 60} min). "
-            "Verification is a **DEMO, dry run** check. This is optional: your campaign and approvals carry on."))
-        await ctx.send(sender, req)
+              f"{req.reference} {funds.amount} {funds.currency}")
+        # Chat card first. A bounced RequestPayment envelope must not swallow this reply.
+        await ctx.send(sender, lead_pack_card(req))
     except Exception as err:  # noqa: BLE001
         ctx.logger.warning(f"payment offer failed: {redact(err)}")
         await _safe_send(ctx, sender, chat_text(
             f"I couldn't create the payment request ({redact(err)}). The free campaign is unaffected."))
+        return
+    await _safe_send(ctx, sender, req)
 
 
 def check_commit(msg: CommitPayment, pending: dict | None) -> str:
@@ -1940,7 +2018,7 @@ async def on_commit(ctx: Context, sender: str, msg: CommitPayment):
         await _safe_send(ctx, sender, CompletePayment(transaction_id=msg.transaction_id))
         rows = pack_rows(load(ctx, sender))
         await _safe_send(ctx, sender, chat_text(
-            f"✅ Payment `{msg.transaction_id}` accepted (DEMO, dry run verification). Your **verified lead pack** "
+            f"✅ Payment `{msg.transaction_id}` accepted (DEMO, dry run verification). Your **Harvest Agent lead pack** "
             f"({len(rows)} contacts, each with the page it was published on):\n" + ("\n".join(rows) or "none")))
     except Exception:  # noqa: BLE001
         ctx.logger.exception("payment commit failed")
@@ -1957,6 +2035,27 @@ async def on_reject(ctx: Context, sender: str, msg: RejectPayment):
         await _safe_send(ctx, sender, chat_text("No problem, no lead pack. Your free campaign carries on as normal."))
     except Exception:  # noqa: BLE001
         ctx.logger.exception("payment reject failed")
+
+
+async def simulate_payment(ctx: Context, sender: str) -> None:
+    """Demo CommitPayment for clients that drop the RequestPayment envelope. No chain and no funds."""
+    pending = ctx.storage.get(_pending_key(sender))
+    if not isinstance(pending, dict) or not pending.get("reference"):
+        await ctx.send(sender, chat_text("There's no open lead pack request to simulate."))
+        return
+    commit = CommitPayment(
+        funds=Funds(
+            amount=str(pending["amount"]),
+            currency=str(pending["currency"]),
+            payment_method=str(pending.get("payment_method") or "fet_direct"),
+        ),
+        recipient=str(pending["recipient"]),
+        transaction_id=f"demo-{pending['reference']}",
+        reference=str(pending["reference"]),
+        description="Harvest Agent lead pack",
+        metadata={"verification": "DEMO, dry run"},
+    )
+    await on_commit(ctx, sender, commit)
 
 
 # ---------- orchestrator ----------
@@ -2600,6 +2699,8 @@ async def dispatch(ctx: Context, sender: str, camp: dict, cmd: dict) -> dict:
         await edit_draft(ctx, sender, camp, args)
     elif intent == "buy_lead_pack":
         await offer(ctx, sender, camp)
+    elif intent == "simulate_payment":
+        await simulate_payment(ctx, sender)
     elif intent in ("add_lead", "import_list", "classify_reply"):
         await ctx.send(sender, chat_text(f"*{intent.replace('_', ' ')}* isn't part of this demo yet. {HELP}"))
     elif camp["state"] in (IDLE, SETUP, DONE) and cmd.get("confidence", 0) < 0.6:

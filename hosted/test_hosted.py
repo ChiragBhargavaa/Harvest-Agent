@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -15,7 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "agents"))
 
 from uagents import Protocol  # noqa: E402
-from uagents_core.contrib.protocols.chat import ChatMessage, TextContent  # noqa: E402
+from uagents_core.contrib.protocols.chat import ChatMessage, MetadataContent, TextContent  # noqa: E402
+from uagents_core.contrib.protocols.payment import payment_protocol_spec  # noqa: E402
 from uagents_core.models import Model  # noqa: E402
 
 import common  # noqa: E402
@@ -491,6 +493,244 @@ def test_remote_sender_not_implemented_still_dry_runs():
     assert outbox[0]["dry_run"] is True
 
 
+def _nominatim_body():
+    return [{
+        "display_name": "Jaipur, Rajasthan, India",
+        "lat": "26.9", "lon": "75.8",
+        "boundingbox": ["26.7", "27.1", "75.6", "76.0"],
+    }]
+
+
+def test_overpass_failover_and_partial_website_lookup():
+    """A dead Overpass mirror is retried once, then the next mirror is used. A slow website
+    lookup batch is cancelled and websites from the batches that finished are kept."""
+    ctx = FakeCtx()
+    calls = []
+    os.environ["LEADREACH_OVERPASS_RETRY_PAUSE"] = "0"
+    os.environ["LEADREACH_LOOKUP_CAP"] = "0.3"
+    os.environ.pop("LEAD_FINDER_AGENT_ADDRESS", None)
+
+    def element(osm_id, name):
+        return {
+            "type": "node", "id": osm_id, "lat": 26.9, "lon": 75.8,
+            "tags": {"name": name, "amenity": "cafe"},
+        }
+
+    async def fake_http(method, url, **kwargs):
+        calls.append((url, kwargs.get("timeout"), (kwargs.get("data") or {}).get("data"),
+                      (kwargs.get("headers") or {}).get("User-Agent")))
+        if "nominatim" in url:
+            body = _nominatim_body()
+        elif "overpass-api.de" in url or "kumi.systems" in url:
+            return {"status": 504, "headers": {}, "content": b"", "url": url}
+        elif "private.coffee" in url:
+            body = {"elements": [element(i, name) for i, name in
+                                 enumerate(("Alpha Cafe", "Beta Cafe", "Gamma Cafe", "Fast Cafe"), start=1)]}
+        else:
+            html = b"<html><head><title>Fast Cafe</title></head><body>Fast Cafe</body></html>"
+            return {"status": 200, "headers": {"Content-Type": "text/html"}, "content": html, "url": url}
+        return {"status": 200, "headers": {"Content-Type": "application/json"},
+                "content": json.dumps(body).encode(), "url": url}
+
+    async def websites(businesses, city):
+        if len(businesses) > 1:
+            await asyncio.sleep(2)
+            return {}
+        return {businesses[0]["id"]: "https://fastcafe.in"}
+
+    mod.http_request = fake_http
+    original = mod.find_websites
+    mod.find_websites = websites
+    records = []
+
+    class Grab(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = Grab()
+    logging.getLogger("harvest-agent").addHandler(handler)
+    try:
+        async def run():
+            return await mod.find_leads({
+                "icp": {"city": "Jaipur", "business_types": ["cafe"], "osm_tags": ["amenity=cafe"],
+                        "search_queries": []},
+                "limit": 5,
+            }, ctx)
+
+        started = time.monotonic()
+        result = asyncio.run(run())
+        elapsed = time.monotonic() - started
+    finally:
+        mod.find_websites = original
+        logging.getLogger("harvest-agent").removeHandler(handler)
+        os.environ.pop("LEADREACH_OVERPASS_RETRY_PAUSE", None)
+        os.environ.pop("LEADREACH_LOOKUP_CAP", None)
+
+    overpass = [url for url, _, query, _ in calls if "interpreter" in url]
+    assert overpass.count("https://overpass-api.de/api/interpreter") == 2
+    assert overpass.count("https://overpass.kumi.systems/api/interpreter") == 2
+    assert overpass.count("https://overpass.private.coffee/api/interpreter") == 1
+    query = next(q for url, _, q, _ in calls if "private.coffee" in url)
+    assert "[timeout:8]" in query
+    assert "out center tags 40" in query
+    assert all(timeout is not None and timeout <= 10 for url, timeout, _, _ in calls if "interpreter" in url)
+    assert any("interpreter" in url and "LeadReachBot/0.1" in (ua or "") for url, _, _, ua in calls)
+    assert any("overpass.private.coffee" in line for line in records)
+    assert any("fastcafe.in" in (lead.get("website") or "") for lead in result["leads"])
+    assert any("kept 1 result" in note for note in result["source_notes"])
+    assert elapsed < 4.5  # nominatim's 1s pause plus the 0.3s lookup cap, not the 2s slow batch
+
+
+def test_finder_overpass_mirrors():
+    """The hosted finder file uses the same mirror list and logs which one served."""
+    spec = importlib.util.spec_from_file_location("hosted_finder", ROOT / "hosted" / "finder" / "agent.py")
+    finder = importlib.util.module_from_spec(spec)
+    finder.agent = StubAgent()
+    sys.modules["hosted_finder"] = finder
+    spec.loader.exec_module(finder)
+    finder._geo_cache.clear()
+    os.environ["LEADREACH_OVERPASS_RETRY_PAUSE"] = "0"
+    seen = []
+
+    class Resp:
+        def __init__(self, status, payload):
+            self.status = status
+            self._payload = payload
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def json(self, content_type=None):
+            return self._payload
+
+    class Session:
+        def __init__(self, *args, **kwargs):
+            self.headers = kwargs.get("headers") or {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def post(self, url, data=None, timeout=None):
+            seen.append((url, (data or {}).get("data"), self.headers.get("User-Agent"),
+                         getattr(timeout, "total", None)))
+            if "private.coffee" in url:
+                return Resp(200, {"elements": [{
+                    "type": "node", "id": 7, "lat": 26.9, "lon": 75.8,
+                    "tags": {"name": "Mirror Cafe", "amenity": "cafe"},
+                }]})
+            return Resp(504, {})
+
+    finder.aiohttp.ClientSession = Session
+    records = []
+
+    class Grab(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = Grab()
+    logging.getLogger("leadreach-finder").addHandler(handler)
+    try:
+        async def run():
+            return await finder.find_businesses(["amenity=cafe"], [26.7, 27.1, 75.6, 76.0])
+
+        leads = asyncio.run(run())
+    finally:
+        logging.getLogger("leadreach-finder").removeHandler(handler)
+        os.environ.pop("LEADREACH_OVERPASS_RETRY_PAUSE", None)
+
+    assert [url for url, *_ in seen].count("https://overpass-api.de/api/interpreter") == 2
+    assert leads[0]["name"] == "Mirror Cafe"
+    assert "[timeout:8]" in seen[-1][1]
+    assert "out center tags 40" in seen[-1][1]
+    assert "LeadReachBot/0.1" in (seen[-1][2] or "")
+    assert seen[-1][3] <= 10
+    assert any("overpass.private.coffee" in line for line in records)
+
+
+def _card_payload(msg) -> dict | None:
+    for part in getattr(msg, "content", []) or []:
+        if isinstance(part, MetadataContent):
+            raw = part.metadata.get("card_payload") if isinstance(part.metadata, dict) else None
+            return json.loads(raw) if raw else None
+    return None
+
+
+def test_lead_pack_card_survives_bounced_request_and_simulates():
+    """RequestPayment uses the chat sender and the official seller spec. The chat card is sent
+    first, and Simulate payment (demo) completes the existing demo commit path."""
+    official = Protocol(spec=payment_protocol_spec, role="seller")
+    assert mod.pay_proto._role == "seller"
+    assert mod.pay_proto.manifest()["metadata"]["digest"] == official.manifest()["metadata"]["digest"]
+    assert any(proto is mod.pay_proto and published for proto, published in stub.included)
+
+    ctx = FakeCtx()
+    os.environ["LEADPACK_PRICE"] = "0.25"
+    os.environ.pop("LEADPACK_RECIPIENT", None)
+    wallet = "fetch1" + "q" * 50
+    camp = mod.fresh_campaign()
+    camp["state"] = mod.DONE
+    camp["campaign_id"] = "camp1"
+    camp["target"]["city"] = "Jaipur"
+    camp["leads"] = [{"id": "web:brew", "name": "Brew Lab", "website": "https://brew.test"}]
+    camp["contacts"] = [{
+        "lead_id": "web:brew", "email": "owner@brew.test", "role": "owner",
+        "source_url": "https://brew.test",
+    }]
+    ctx.storage.set(mod.storage_key(SENDER), camp)
+
+    async def send(dest, msg):
+        ctx.sent.append((dest, msg))
+        if type(msg).__name__ == "RequestPayment":
+            raise RuntimeError("Failed to dispatch envelope")
+
+    ctx.send = send
+    try:
+        async def buy():
+            await mod.handle_chat(ctx, SENDER, chat("buy lead pack"))
+
+        asyncio.run(buy())
+        names = [type(msg).__name__ for _, msg in ctx.sent]
+        assert names.index("ChatMessage") < names.index("RequestPayment")
+        request = next(msg for _, msg in ctx.sent if type(msg).__name__ == "RequestPayment")
+        assert all(dest == SENDER for dest, msg in ctx.sent if type(msg).__name__ == "RequestPayment")
+        assert request.description.startswith("Harvest Agent lead pack")
+        assert "verified lead pack" not in request.description
+        assert request.accepted_funds[0].amount == "0.25"
+        assert request.accepted_funds[0].currency == "FET"
+        assert request.recipient == wallet
+        card_msg = next(msg for _, msg in ctx.sent if _card_payload(msg))
+        payload = _card_payload(card_msg)
+        assert payload["title"] == "Harvest Agent lead pack"
+        values = " ".join(row["value"] for row in payload["summary_rows"])
+        assert "0.25 FET" in values
+        assert wallet in values
+        assert request.reference in values
+        assert "Demo only, no real funds move" in values
+        assert payload["ctas"][0]["label"] == "Simulate payment (demo)"
+        assert payload["ctas"][0]["selection"]["action"] == "simulate_payment"
+        assert "couldn't create the payment request" not in "\n".join(texts(ctx))
+
+        async def simulate():
+            await mod.handle_chat(ctx, SENDER, chat('{"action": "simulate_payment", "step": "payment"}'))
+
+        asyncio.run(simulate())
+    finally:
+        os.environ.pop("LEADPACK_PRICE", None)
+
+    assert any(type(msg).__name__ == "CompletePayment" for _, msg in ctx.sent)
+    done = "\n".join(texts(ctx))
+    assert "Harvest Agent lead pack" in done
+    assert "owner@brew.test" in done
+    assert ctx.storage.get(mod._pending_key(SENDER)) is None
+    assert "verified lead pack" not in done
+
+
 if __name__ == "__main__":
     test_file_compiles_and_protocols_match()
     test_logger_calls_take_one_message()
@@ -503,4 +743,7 @@ if __name__ == "__main__":
     test_contacts_reviews_drafts_and_unpriced_pack()
     test_remote_success_skips_inline()
     test_remote_sender_not_implemented_still_dry_runs()
+    test_overpass_failover_and_partial_website_lookup()
+    test_finder_overpass_mirrors()
+    test_lead_pack_card_survives_bounced_request_and_simulates()
     print("hosted tests ok")
