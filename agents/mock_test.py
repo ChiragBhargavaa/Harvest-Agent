@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import threading
+from pathlib import Path
 
 # must be set before the agents are imported
 os.environ["MAILBOX"] = "false"
@@ -71,6 +72,8 @@ async def fake_parse_intent(text, state, gate, numbered):
         return {"intent": "start_campaign", "args": {"brief": text, "city": "Jaipur"}, "confidence": 0.95}
     if "stop asking" in t:
         return {"intent": "update_settings", "args": {"ask_before": {"contacts": False}}, "confidence": 0.9}
+    if t.startswith("add lead"):
+        return {"intent": "add_lead", "args": {}, "confidence": 0.9}
     if t.startswith(("make", "never")):  # "make this one ..." = this draft; "make them ..." / "never ..." = general
         return {"intent": "edit_draft", "args": {"instruction": text, "general": "this one" not in t},
                 "confidence": 0.9}
@@ -279,6 +282,7 @@ async def unit_tests():
     card_cap_tests()
     orchestrator_log_tests()
     await llm_request_tests()
+    await asyncio.to_thread(supervisor_tests)
 
 
 async def _find_with(fake, queries: list[str], timeout_s: float | None = None) -> tuple[dict, float]:
@@ -878,6 +882,34 @@ def orchestrator_log_tests():
           f"orchestrator: draft skips logged as warnings with their detail, secrets redacted ({capture.lines})")
 
 
+def supervisor_tests():
+    """scripts/run_all.supervise with dummy children: restarts an exiting one, terminates a running one on stop."""
+    import importlib.util
+    import sys
+    import time
+
+    spec = importlib.util.spec_from_file_location("run_all", Path(__file__).resolve().parent.parent / "scripts" / "run_all.py")
+    run_all = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(run_all)
+    started: list = []
+    real_start = run_all._start
+    run_all._start = lambda name, cmd: started.append((name, real_start(name, cmd))) or started[-1][1]
+    stop = threading.Event()
+    cmds = {"quick": [sys.executable, "-c", "print('dummy child ran')"],
+            "slow": [sys.executable, "-c", "import time; time.sleep(60)"]}
+    out: dict = {}
+    t = threading.Thread(target=lambda: out.update(run_all.supervise(cmds, stop, base_delay=0.05, max_delay=0.2,
+                                                                     max_restarts=2, poll=0.05)))
+    t.start()
+    time.sleep(1.5)
+    stop.set()
+    t.join(15)
+    slow = [p for name, p in started if name == "slow"]
+    check(not t.is_alive() and out == {"quick": 2, "slow": 0} and sum(n == "quick" for n, _ in started) == 3,
+          f"supervisor restarts an exiting child up to max_restarts ({out})")
+    check(len(slow) == 1 and slow[0].poll() is not None, "supervisor terminates running children on stop")
+
+
 @user.on_event("startup")
 async def run_script(ctx: Context):
     await asyncio.sleep(2)
@@ -888,6 +920,8 @@ async def run_script(ctx: Context):
         msg = await say(ctx, "hi", has_text("LeadReach"))
         check(msg is not None, "help reply to 'hi'")
         check(acks >= 1, "chat acknowledgement received")
+        msg = await say(ctx, "add lead Cafe Foo", has_text("add lead", "isn't part of this demo yet", "LeadReach"))
+        check(msg is not None and "coming soon" not in text_of(msg), "unimplemented intent -> 'not part of this demo' + help")
 
         msg = await say(ctx, "I sell organic coffee beans, find cafés in Jaipur", is_card("review"))
         check(msg is not None, "ICP review card shown")

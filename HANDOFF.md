@@ -159,6 +159,7 @@ each **profile URL** into the `README.md` table.
 .venv/bin/ruff check agents scripts                   # lint
 .venv/bin/python scripts/probe_sources.py Jaipur cafe # lead-source go/no-go (needs ASI1_API_KEY)
 .venv/bin/python agents/local_test.py "<brief>"       # live loop in terminal (real LLM + network)
+python scripts/run_all.py                              # starts all 6 agents, restarts any that exit
 bash setup.sh                                          # safe to re-run: keeps .env/seeds, re-derives addresses
 # deps changed?  uv lock && uv export --no-hashes --no-dev --no-emit-project -o requirements.txt
 ```

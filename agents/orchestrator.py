@@ -595,7 +595,7 @@ async def dispatch(ctx: Context, sender: str, camp: dict, cmd: dict) -> dict:
     elif intent == "edit_draft":
         await edit_draft(ctx, sender, camp, args)
     elif intent in ("add_lead", "import_list", "classify_reply"):
-        await ctx.send(sender, chat_text(f"*{intent.replace('_', ' ')}* is coming soon. {HELP}"))
+        await ctx.send(sender, chat_text(f"*{intent.replace('_', ' ')}* isn't part of this demo yet. {HELP}"))
     elif camp["state"] in (st.IDLE, st.SETUP, st.DONE) and cmd.get("confidence", 0) < 0.6:
         await ctx.send(sender, chat_text(HELP))
     else:
