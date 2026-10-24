@@ -48,6 +48,8 @@ FAST_INTENTS = {  # exact phrases handled without an LLM call
     "log": "show_log", "show log": "show_log", "new campaign": "start_campaign", "start": "start_campaign",
     "call list": "call_list",
 }
+STYLE_RULE_DECLINE = {"no", "just this one", "just this draft", "only this one", "only this draft"}
+SKIP_REASONS = {"no_contact": "no email found", "llm_failed": "the writer failed"}
 HELP = (
     "I'm **LeadReach**: I find local businesses that fit your brand, their published emails, evidence-based "
     "reasons to contact them, and draft personal emails - stopping for your approval at every step.\n\n"
@@ -95,6 +97,8 @@ async def understand(text: str, camp: dict) -> dict:
     if cmd := parse_card_action(text):
         return cmd
     low = text.lower().strip(" .!")
+    if camp.get("pending_style_rule") and low in STYLE_RULE_DECLINE:
+        return {"intent": "reject", "args": {"step": "style_rule"}, "confidence": 1.0}
     if low == "approve all":
         return {"intent": "approve", "args": {"all": True}, "confidence": 1.0}
     if low in FAST_INTENTS:
@@ -152,8 +156,8 @@ def lead_rows(leads: list[dict]) -> list[dict]:
     return rows
 
 
-def checkpoint(gate: str, camp: dict) -> ChatMessage:
-    """The approval card for a gate. Also records what the numbered list refers to."""
+def checkpoint(gate: str, camp: dict, note: str = "") -> ChatMessage:
+    """The approval card for a gate. Also records what the numbered list refers to. `note` is shown on draft cards."""
     if gate == "icp":
         icp = camp["icp"]
         rows = [
@@ -195,7 +199,12 @@ def checkpoint(gate: str, camp: dict) -> ChatMessage:
                                  extra_hint="Say **show lead 2** for the evidence.")
     if gate == "drafts":
         i = camp["draft_cursor"]
-        return cards.draft_card(camp["drafts"][i], i + 1, len(camp["drafts"]))
+        if not note and i == 0 and camp["draft_skipped"]:
+            names = {lead["id"]: lead["name"] for lead in camp["leads"]}
+            note = "No draft for: " + "; ".join(
+                f"{names.get(s['lead_id'], s['lead_id'])} ({SKIP_REASONS.get(s.get('reason'), s.get('reason'))})"
+                for s in camp["draft_skipped"]) + "."
+        return cards.draft_card(camp["drafts"][i], i + 1, len(camp["drafts"]), note)
     s = camp["settings"]
     rows = [{"label": "Approved drafts", "value": str(sum(1 for d in camp["drafts"] if d.get("approved")))},
             {"label": "Dry run", "value": "on" if s["dry_run"] else "OFF - real emails"},
@@ -235,6 +244,7 @@ def store_result(gate: str, camp: dict, result: dict) -> int:
         return len(camp["reviews"])
     if gate == "drafts":
         camp["drafts"], camp["draft_cursor"] = result.get("drafts", []), 0
+        camp["draft_skipped"], camp["pending_style_rule"] = result.get("skipped", []), None
         return len(camp["drafts"])
     camp["send_result"] = result
     return len(result.get("sent", [])) + len(result.get("queued", []))
@@ -321,6 +331,8 @@ async def approve(ctx: Context, sender: str, camp: dict, args: dict) -> None:
     if gate is None:
         await ctx.send(sender, chat_text("There's nothing waiting for approval. Say **status** or **help**."))
         return
+    if await answer_style_rule(ctx, sender, camp, args, accepted=True):
+        return
     if gate == "drafts" and camp["drafts"]:
         todo = camp["drafts"][camp["draft_cursor"]:] if args.get("all") else [camp["drafts"][camp["draft_cursor"]]]
         for draft in todo:
@@ -343,6 +355,8 @@ async def reject(ctx: Context, sender: str, camp: dict, args: dict) -> None:
     gate = st.pending_gate(camp)
     if gate is None:
         await ctx.send(sender, chat_text("Nothing to redo right now. Say **status** or **help**."))
+        return
+    if await answer_style_rule(ctx, sender, camp, args, accepted=False):
         return
     if gate == "drafts" and camp["drafts"]:  # "Skip" on a draft card
         camp["drafts"][camp["draft_cursor"]]["approved"] = False
@@ -375,6 +389,73 @@ async def approve_cursor_advance(ctx: Context, sender: str, camp: dict) -> None:
         await ctx.send(sender, checkpoint("drafts", camp))
     else:
         await run_from(ctx, sender, camp, "send")
+
+
+async def redraft(ctx: Context, sender: str, camp: dict, lead_ids: list[str], extra_rules: list[str]) -> str:
+    """Rewrite these leads' drafts in place (campaign style_rules + extra_rules). -> error ("" = ok)."""
+    ids = set(lead_ids)
+    args = dict(step_args("drafts", camp), leads=[lead for lead in camp["leads"] if lead["id"] in ids],
+                style_rules=camp["style_rules"] + extra_rules)
+    if not args["leads"]:
+        return "those leads are no longer in the campaign"
+    await ctx.send(sender, chat_text("Rewriting..."))
+    result, error = await call_tool(ctx, "draft_emails", args)
+    if result is None:
+        return error
+    new = {d["lead_id"]: d for d in result.get("drafts", []) if d.get("lead_id") in ids}
+    camp["drafts"] = [new.get(d["lead_id"], d) for d in camp["drafts"]]  # an LLM failure keeps the old draft
+    return "" if new else "the writer returned no draft"
+
+
+async def edit_draft(ctx: Context, sender: str, camp: dict, args: dict) -> None:
+    """A specific edit rewrites one draft; a general one is proposed as a style rule and waits for confirmation."""
+    instruction = str(args.get("instruction") or "").strip()
+    if st.pending_gate(camp) != "drafts" or not camp["drafts"]:
+        await ctx.send(sender, chat_text("I can edit emails once the drafts are ready (at the drafts checkpoint)."))
+        return
+    if not instruction:
+        await ctx.send(sender, chat_text("How should I change it? e.g. *\"shorter and warmer\"*."))
+        return
+    general = args.get("general")
+    if general is True or (not isinstance(general, bool) and _truthy(general)):
+        camp["pending_style_rule"] = instruction
+        st.log(camp, "drafts", "style rule proposed", "system", instruction)
+        await ctx.send(sender, cards.style_rule_card(instruction))
+        return
+    lead_ids = [d["lead_id"] for d in camp["drafts"]]
+    if args.get("lead_id") in lead_ids:  # a draft card's lead_id; otherwise the draft on screen
+        camp["draft_cursor"] = lead_ids.index(args["lead_id"])
+    current = lead_ids[camp["draft_cursor"]]
+    st.log(camp, "drafts", f"edited {current}", "user", instruction)
+    error = await redraft(ctx, sender, camp, [current], [instruction])
+    note = f"⚠ I couldn't rewrite it ({error}); here's the previous version." if error \
+        else f"Rewrote this draft: *\"{instruction}\"*."
+    await ctx.send(sender, checkpoint("drafts", camp, note))
+
+
+async def answer_style_rule(ctx: Context, sender: str, camp: dict, args: dict, accepted: bool) -> bool:
+    """Handle yes / "just this one" for a proposed style rule. -> False if no proposal was waiting."""
+    rule = camp.get("pending_style_rule")
+    if (not rule or st.pending_gate(camp) != "drafts" or args.get("all")
+            or args.get("step") not in (None, "", "style_rule")):
+        camp["pending_style_rule"] = None  # e.g. a draft card's own approve/skip: the proposal lapses
+        return False
+    camp["pending_style_rule"] = None
+    if accepted:
+        if rule not in camp["style_rules"]:
+            camp["style_rules"].append(rule)
+        st.log(camp, "drafts", "style rule added", "user", rule)
+        todo = [d["lead_id"] for d in camp["drafts"][camp["draft_cursor"]:] if not d.get("approved")]
+        error = await redraft(ctx, sender, camp, todo, []) if todo else ""
+        note = f"Saved style rule *\"{rule}\"*" + (f", but I couldn't rewrite the drafts ({error})." if error
+                                                   else f" and rewrote {len(todo)} draft(s).")
+    else:
+        current = camp["drafts"][camp["draft_cursor"]]["lead_id"]
+        st.log(camp, "drafts", f"edited {current}", "user", rule)
+        error = await redraft(ctx, sender, camp, [current], [rule])
+        note = f"⚠ I couldn't rewrite it ({error})." if error else f"Applied *\"{rule}\"* to this draft only."
+    await ctx.send(sender, checkpoint("drafts", camp, note))
+    return True
 
 
 async def remove_items(ctx: Context, sender: str, camp: dict, args: dict) -> None:
@@ -495,7 +576,9 @@ async def dispatch(ctx: Context, sender: str, camp: dict, cmd: dict) -> dict:
         rows = [f"- {x['name']} · {x.get('phone')} · {x.get('address') or ''}" for x in camp["call_list"]]
         body = "\n".join(rows) or "none"
         await ctx.send(sender, chat_text("**Phone-only businesses** (no published email)\n" + body))
-    elif intent in ("edit_draft", "add_lead", "import_list", "classify_reply"):
+    elif intent == "edit_draft":
+        await edit_draft(ctx, sender, camp, args)
+    elif intent in ("add_lead", "import_list", "classify_reply"):
         await ctx.send(sender, chat_text(f"*{intent.replace('_', ' ')}* is coming soon. {HELP}"))
     elif camp["state"] in (st.IDLE, st.SETUP, st.DONE) and cmd.get("confidence", 0) < 0.6:
         await ctx.send(sender, chat_text(HELP))

@@ -49,6 +49,8 @@ DEFAULT_CAMPAIGN = {
         "dry_run": env_bool("DRY_RUN", True),
     },
     "style_rules": [],
+    "pending_style_rule": None,  # a general edit_draft instruction waiting for the user's yes / "just this one"
+    "draft_skipped": [],  # draft_emails "skipped" entries (no contact / LLM failed)
     "log": [],
 }
 

@@ -183,7 +183,9 @@ Never invent facts, numbers, names or features. Reply ONLY with JSON: \
 {{"subject": "...", "body_text": "...", "hook_used": "... or null"}}"""
 
 
-async def draft_email(profile: dict, lead: dict, qualification: dict, style_rules: list[str]) -> dict:
+async def draft_email(profile: dict, lead: dict, qualification: dict, style_rules: list[str],
+                      problems: list[str] | None = None) -> dict:
+    """`problems` = what the copywriter's validator rejected in the previous attempt (regenerate once)."""
     b, e = profile.get("brand", {}), profile.get("email", {})
     system = DRAFT_PROMPT.format(
         sender_name=b.get("sender_name"), brand=b.get("name"), max_words=e.get("max_words", 150),
@@ -191,8 +193,10 @@ async def draft_email(profile: dict, lead: dict, qualification: dict, style_rule
         pricing=profile.get("pricing"), cta=profile.get("cta", {}).get("text"),
         unsubscribe_line=e.get("unsubscribe_line"), language=e.get("language", "English"), style_rules=style_rules,
     )
-    user = json.dumps({"lead": lead, "qualification": qualification}, ensure_ascii=False)
-    return await complete_json(system, user, max_tokens=800)
+    payload = {"lead": lead, "qualification": qualification}
+    if problems:
+        payload["fix_these_problems_in_your_previous_draft"] = problems
+    return await complete_json(system, json.dumps(payload, ensure_ascii=False), max_tokens=800)
 
 
 CLASSIFY_REPLY_PROMPT = """Classify a business's reply to an outreach email. Labels: interested | meeting_requested | \

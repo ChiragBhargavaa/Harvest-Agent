@@ -270,10 +270,16 @@ plus `pages_crawled`) → `llm.qualify` (60 s timeout). A hook is kept only if i
 LLM failure (error, timeout, bad JSON, missing/invalid `fit_score` or `hooks`) → deterministic signals-only review,
 `fallback: true`, no hooks. No website or failed crawl → `reachable: false` + `unreachable_reason`
 (`no_website|banned_host|robots_disallowed|unreachable`), signals-only, no LLM call. `contacts` is accepted but not used yet.
-**`draft_emails`** (M4)
+**`draft_emails`** ✅ implemented (M4)
 ```jsonc
-{"profile": BrandProfile, "style_rules": [], "icp": ICP, "leads": [Lead], "contacts": [Contact], "reviews": [Review]}  →  {"drafts": [Draft]}
+{"profile": BrandProfile, "style_rules": [], "icp": ICP, "leads": [Lead], "contacts": [Contact], "reviews": [Review]}
+→ {"drafts": [Draft], "skipped": [{"lead_id": "...", "reason": "no_contact|llm_failed", "detail": "... (llm_failed only)"}]}
 ```
+One draft per lead that has a contact, addressed to its first (= primary, §3.7 `find_contacts` sort) contact; sorted best
+fit first. Leads are drafted concurrently (≤8 at a time), `llm.draft_email` with a 25 s timeout per attempt, then the
+validator (§3.12). A lead with no contact, or whose first LLM call fails (error, timeout, bad JSON), goes to `skipped`:
+the copywriter never writes a draft without the LLM. The orchestrator stores `skipped` as `draft_skipped` and names those
+leads on the first draft card.
 **`send_emails`** (stretch)
 ```jsonc
 {"campaign_id": "c_...", "drafts": [Draft], "dry_run": true, "redirect_to": "test@example.com", "daily_cap": 5}
@@ -327,7 +333,7 @@ Emails failing `crawl.mx_ok` are dropped. Roles from `crawl.guess_role` map foun
 IDLE --start_campaign(brief + city; else setup form)--> BUILDING_ICP --> AWAIT_ICP (or auto → FINDING)
 AWAIT_<gate> --approve--> next step;  --remove_items(ids)--> re-render;  --reject(feedback)--> redo (max 2 per step)
   reject on leads with feedback → feedback is appended to the brief and the ICP is rebuilt
-AWAIT_DRAFTS: one draft at a time (draft_cursor); approve / skip / "approve all"
+AWAIT_DRAFTS: one draft at a time (draft_cursor); approve / skip / "approve all"; edit_draft (§3.10.4)
 any step error or timeout --> STEP_FAILED (failed_gate) --retry--> same step;  --skip--> next step
 ANY --pause--> PAUSED (paused_from);  PAUSED --resume--> paused_from (re-shows the pending card)
 ANY --status--> status detail card;  --log--> last 10 audit entries
@@ -340,7 +346,15 @@ ANY --status--> status detail card;  --log--> last 10 audit entries
 3. **Otherwise `llm.parse_intent(text, state, gate, last_list_names)`** →
    `{"intent": "start_campaign|approve|reject|remove_items|edit_draft|add_lead|import_list|update_settings|pause|resume|status|show_log|show_lead|classify_reply|help|unknown", "args": {}, "confidence": 0..1}`.
    Low confidence → one short clarifying message listing what can be done at this checkpoint.
-4. **Learning from edits (M4):** a general `edit_draft` instruction is appended to `style_rules` after a one-line confirmation.
+4. **Learning from edits (M4)** ✅ (`orchestrator.edit_draft`, only at `AWAIT_DRAFTS`), args `{"instruction", "general", "lead_id"?}`:
+   - **specific** (`general: false`): rewrites that draft (the card's `lead_id`, else the one on screen) with
+     `style_rules + [instruction]`; nothing is saved.
+   - **general** (`general: true`, e.g. "make them shorter"): stored as `pending_style_rule` and a `style_rule_card` asks
+     to confirm (selections `{"action": "approve|reject", "step": "style_rule"}`). **approve / yes** → appended to the
+     campaign's `style_rules` (logged, actor `user`) and every unapproved draft from the cursor on is rewritten;
+     **reject / "just this one" / no** → applied to the current draft only. A draft card's own approve/skip
+     (`step: "drafts"`) or "approve all" drops the proposal. Rewrites call `draft_emails` with just those leads; a lead
+     that fails keeps its old draft.
 
 ### 3.11 Cards (`agents/cards.py`, payload schemas ✅ §4.5)
 - **The narration must stand alone:** it lists the items and says how to reply in chat ("Reply approve, remove 2, 5, or redo…").
@@ -357,9 +371,13 @@ All prompts demand **JSON only** (`complete_json`: parse, retry once with the er
 `web_search_options={"search_context_size": ASI1_SEARCH_CONTEXT}` (§4.4); calls without search send no search field at all.
 It can be turned off with `ASI1_WEB_SEARCH=false`.
 
-**Deterministic draft validator (M4, copywriter):** word count ≤ `max_words`; subject ≤ 8 words and ≤ 60 chars; exact unsubscribe
-line; sender name and brand present; no `{` `}` placeholders; no price unless `mention_price`; `hook_used` matches a review hook.
-Regenerate once on failure, then return the draft with `warnings`.
+**Deterministic draft validator (M4, `copywriter.validate`)** ✅: body word count ≤ `email.max_words` (default 150); subject
+non-empty, ≤ 8 words and ≤ 60 chars; the exact `email.unsubscribe_line` in the body; `brand.sender_name` and `brand.name`
+in the body; no `{` `}` or `❓` placeholders; no price (₹/Rs/INR/$ amounts, `/-`) unless `pricing.mention_price` is `true`;
+`hook_used` is null or matches a review hook's observation / evidence / angle. Profile values that are missing or still
+❓ count as failures ("not filled in"), so an unfilled brand profile shows up as draft warnings, never as invented facts.
+On failure regenerate once via `llm.draft_email(..., problems=[...])` (the problems are passed back to the LLM), then
+return the draft with the remaining problems as `warnings` (a failing regenerate keeps the first draft and its warnings).
 
 ### 3.13 Data sources and crawling rules
 **Lead sources (no Google key needed)**
@@ -443,7 +461,7 @@ agents/
   lead_finder.py     find_leads                                           ✅ M1 logic
   contact_finder.py  find_contacts                                        ✅ M2 logic
   lead_analyst.py    qualify_leads                                        ✅ M3 logic
-  copywriter.py      draft_emails (shell → M4)
+  copywriter.py      draft_emails + validator                             ✅ M4 logic
   sender.py          send_emails (shell → M6, stretch)
   mock_test.py       offline end-to-end test (mocked LLM + OSM + fetch)
   local_test.py      live loop: all agents + interactive fake user (real LLM/network)
@@ -456,7 +474,7 @@ Shared modules are fine for mailbox agents run from this repo. If an agent moves
 helpers into one file (§4.7).
 
 ### 3.18 Milestones and acceptance tests
-**Mock test** ✅ (`agents/mock_test.py`, 57 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
+**Mock test** ✅ (`agents/mock_test.py`, 76 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
 fetcher and `mx_ok` are monkeypatched; all agents + a scripted user run in a `Bureau(port=8010)`; exit code 0 = pass.
 
 | Milestone | Done when |
@@ -697,9 +715,11 @@ agent.include(pay_proto, publish_manifest=True)
 - **M0 done:** all files in §3.17 exist; the 6 agents boot; `agents/mock_test.py` passes (20 checks) ✅.
 - **Implemented:** orchestrator (intent, gates, cards, pause/resume, settings, retry/skip, audit log), `find_leads`
   (OSM + web search + verification), `find_contacts` (polite crawl + extraction + MX, mock-tested only), `qualify_leads`
-  (crawl + signals + LLM hooks filtered against page text, signals-only fallback; mock-tested only), crawler, geo,
-  all LLM prompts.
-- **Shells (return `ok=False, "not implemented yet"`):** `draft_emails` (M4), `send_emails` (M6).
+  (crawl + signals + LLM hooks filtered against page text, signals-only fallback; mock-tested only), `draft_emails`
+  (LLM drafts + deterministic validator, regenerate once, warnings; mock-tested only), orchestrator `edit_draft`
+  (per-draft edits, general edits → style rules after confirmation), crawler, geo, all LLM prompts.
+- **Shells (return `ok=False, "not implemented yet"`):** `send_emails` (M6). `add_lead` / `import_list` / `classify_reply`
+  are answered "coming soon" (M5).
 - **Not yet done by Chirag:** `ASI1_API_KEY` in `.env`, run `setup.sh`, `scripts/probe_sources.py`, mailbox connection, Agentverse profiles.
 - The earlier generic starter (`specialist.py`/`page_check`) was folded into `common.make_specialist` and `lead_analyst.site_signals`.
 

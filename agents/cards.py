@@ -88,7 +88,7 @@ def detail_card(title: str, rows: list[dict], ctas: list[dict], narration: str, 
     return card(narration, "detail", {"title": title, "summary_rows": rows[:MAX_ROWS], "ctas": ctas}, terminal)
 
 
-def draft_card(draft: dict, index: int, total: int) -> ChatMessage:
+def draft_card(draft: dict, index: int, total: int, note: str = "") -> ChatMessage:
     rows = [
         {"label": "To", "value": draft.get("to") or "-"},
         {"label": "Subject", "value": draft.get("subject", "")},
@@ -105,9 +105,25 @@ def draft_card(draft: dict, index: int, total: int) -> ChatMessage:
                         "primary": True},
         "reject_cta": {"label": "Skip", "selection": {"action": "reject", "step": "drafts", "lead_id": lead_id}},
     }
-    narration = (f"**Draft {index}/{total}** to {draft.get('to')}\n\n**Subject:** {draft.get('subject')}\n\n"
-                 f"{draft.get('body_text')}\n\nReply **approve**, **skip**, **approve all**, or tell me how to edit it "
+    warn = f"⚠ {'; '.join(draft['warnings'])}\n\n" if draft.get("warnings") else ""
+    narration = ((f"{note}\n\n" if note else "") + f"**Draft {index}/{total}** to {draft.get('to')}\n\n"
+                 f"**Subject:** {draft.get('subject')}\n\n{draft.get('body_text')}\n\n{warn}"
+                 "Reply **approve**, **skip**, **approve all**, or tell me how to edit it "
                  "(e.g. *\"shorter and warmer\"*).")
+    return card(narration, "review", payload)
+
+
+def style_rule_card(rule: str) -> ChatMessage:
+    payload = {
+        "title": "Use this for every draft?",
+        "summary_rows": [{"label": "Style rule", "value": rule}],
+        "approve_cta": {"label": "Yes, all drafts", "selection": {"action": "approve", "step": "style_rule"},
+                        "primary": True},
+        "reject_cta": {"label": "Just this draft", "selection": {"action": "reject", "step": "style_rule"}},
+    }
+    narration = (f"Should I remember **\"{rule}\"** as a style rule for every draft in this campaign "
+                 "(and rewrite the drafts you haven't approved yet)?\n\n"
+                 "Reply **yes** to save it, or **just this one** to apply it to this draft only.")
     return card(narration, "review", payload)
 
 

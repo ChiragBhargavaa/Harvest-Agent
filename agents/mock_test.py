@@ -69,6 +69,9 @@ async def fake_parse_intent(text, state, gate, numbered):
         return {"intent": "start_campaign", "args": {"brief": text, "city": "Jaipur"}, "confidence": 0.95}
     if "stop asking" in t:
         return {"intent": "update_settings", "args": {"ask_before": {"contacts": False}}, "confidence": 0.9}
+    if t.startswith(("make", "never")):  # "make this one ..." = this draft; "make them ..." / "never ..." = general
+        return {"intent": "edit_draft", "args": {"instruction": text, "general": "this one" not in t},
+                "confidence": 0.9}
     return {"intent": "unknown", "args": {}, "confidence": 0.2}
 
 
@@ -173,6 +176,27 @@ async def fake_qualify(icp, lead, signals, page_text):
                        "evidence_url": "https://brewlab.test/", "angle": "More outlets, more beans"}]}
 
 
+UNSUB = "If you'd prefer not to hear from me again, just reply 'unsubscribe'."
+PROFILE = {"brand": {"name": "Bean Co", "sender_name": "Asha"}, "offer": {"product": "organic coffee beans"},
+           "pricing": {"mention_price": False}, "cta": {"text": "Free sample?"},
+           "email": {"max_words": 60, "unsubscribe_line": UNSUB}}
+draft_calls: list[dict] = []
+
+
+async def fake_draft_email(profile, lead, qualification, style_rules, problems=None):
+    """A valid draft for PROFILE; the body echoes the style rules so tests can see they arrived."""
+    draft_calls.append({"lead": lead["id"], "style_rules": list(style_rules), "problems": problems})
+    hooks = qualification.get("hooks") or []
+    style = f" ({'; '.join(style_rules)})" if style_rules else ""
+    body = (f"Hi {lead['name']} team, I noticed you take orders by email{style}. We roast organic beans locally. "
+            f"Free sample?\n\nAsha, Bean Co\n{UNSUB}")
+    return {"subject": "Fresh beans for your cafe", "body_text": body,
+            "hook_used": hooks[0]["observation"] if hooks else None}
+
+
+original_load_profile = orchestrator.load_profile
+orchestrator.load_profile = lambda: PROFILE
+llm.draft_email = fake_draft_email
 llm.parse_intent = fake_parse_intent
 llm.qualify = fake_qualify
 llm.build_icp = fake_build_icp
@@ -244,6 +268,7 @@ async def unit_tests():
 
     await contact_unit_tests()
     await analyst_unit_tests()
+    await copywriter_unit_tests()
     await llm_request_tests()
 
 
@@ -435,6 +460,111 @@ async def analyst_unit_tests():
             check(True, f"analyst: bad args raise ValueError ({list(bad)})")
 
 
+REVIEW = {"lead_id": "tapri", "fit_score": 70, "hooks": [
+    {"observation": "Brews espresso all day", "evidence": "We brew espresso all day",
+     "evidence_url": "https://tapri.test/", "angle": "Beans for a busy espresso bar"}]}
+GOOD = {"subject": "Beans for your espresso bar", "hook_used": "Brews espresso all day",
+        "body_text": f"Hi Tapri team, I saw you brew espresso all day. Want a free sample?\n\nAsha, Bean Co\n{UNSUB}"}
+
+
+async def _draft_with(fake, args: dict) -> dict:
+    llm.draft_email, original = fake, llm.draft_email
+    try:
+        return await copywriter.draft_emails(args)
+    finally:
+        llm.draft_email = original
+
+
+def _scripted(*replies):
+    """A fake llm.draft_email returning `replies` in order (an Exception instance is raised)."""
+    calls: list[dict] = []
+
+    async def fake(profile, lead, qualification, style_rules, problems=None):
+        calls.append({"lead": lead["id"], "problems": problems})
+        reply = replies[min(len(calls), len(replies)) - 1]
+        if isinstance(reply, Exception):
+            raise reply
+        return dict(reply)
+
+    return fake, calls
+
+
+async def copywriter_unit_tests():
+    v = copywriter.validate
+    check(v(GOOD, PROFILE, REVIEW) == [], f"copywriter: valid draft passes the validator ({v(GOOD, PROFILE, REVIEW)})")
+    bad = {
+        "max_words": dict(GOOD, body_text=GOOD["body_text"] + " word" * 60),
+        "subject words": dict(GOOD, subject="A really very long subject line with nine words"),
+        "subject chars": dict(GOOD, subject="Supercalifragilisticexpialidocious espresso-beans-for-everyone today"),
+        "unsubscribe": dict(GOOD, body_text=GOOD["body_text"].replace(UNSUB, "Reply stop to opt out.")),
+        "sender name": dict(GOOD, body_text=GOOD["body_text"].replace("Asha, ", "")),
+        "brand": dict(GOOD, body_text=GOOD["body_text"].replace(", Bean Co", "")),
+        "placeholder {}": dict(GOOD, body_text="Hi {first_name}, " + GOOD["body_text"]),
+        "placeholder ❓": dict(GOOD, body_text=GOOD["body_text"] + " ❓ phone"),
+        "price": dict(GOOD, body_text=GOOD["body_text"].replace("free sample", "kilo at ₹450")),
+        "hook_used": dict(GOOD, hook_used="Voted best cafe in Jaipur"),
+    }
+    caught = {k: len(v(d, PROFILE, REVIEW)) == 1 for k, d in bad.items()}
+    check(all(caught.values()), f"copywriter: validator catches each §3.12 rule ({caught})")
+    check(v(bad["price"], dict(PROFILE, pricing={"mention_price": True}), REVIEW) == [],
+          "copywriter: price allowed when pricing.mention_price is true")
+    check(v(dict(GOOD, hook_used="null"), PROFILE, REVIEW) == [] and v(GOOD, PROFILE, {"hooks": []}) != [],
+          "copywriter: hook_used may be null, but must match a review hook")
+    unfilled = v(GOOD, original_load_profile(), REVIEW)  # the real config/brand_profile.yaml is still ❓
+    check(any("not filled in" in p for p in unfilled), "copywriter: ❓ brand profile values are flagged, never used")
+
+    contacts = [{"lead_id": "tapri", "email": "owner@tapri.test", "confidence": "high"},
+                {"lead_id": "tapri", "email": "info@tapri.test", "confidence": "medium"}]
+    args = {"profile": PROFILE, "style_rules": ["be brief"], "icp": ICP, "leads": [_lead("tapri", "https://tapri.test")],
+            "contacts": contacts, "reviews": [REVIEW]}
+    fake, calls = _scripted(GOOD)
+    out = await _draft_with(fake, args)
+    d = out["drafts"][0]
+    check(len(calls) == 1 and d["to"] == "owner@tapri.test" and d["warnings"] == [] and d["approved"] is False
+          and d["word_count"] == len(GOOD["body_text"].split()) and d["hook_used"] == "Brews espresso all day",
+          "copywriter: valid first draft -> one LLM call, primary contact, §3.8 Draft shape")
+
+    fake, calls = _scripted(bad["unsubscribe"], GOOD)
+    d = (await _draft_with(fake, args))["drafts"][0]
+    check(len(calls) == 2 and calls[0]["problems"] is None and any("unsubscribe" in p or UNSUB in p
+                                                                   for p in calls[1]["problems"] or [])
+          and d["warnings"] == [] and d["body_text"] == GOOD["body_text"],
+          "copywriter: failed validation -> regenerated once with the problems passed back")
+
+    fake, calls = _scripted(bad["price"], bad["price"], GOOD)
+    d = (await _draft_with(fake, args))["drafts"][0]
+    check(len(calls) == 2 and d["warnings"] == ["do not mention prices"] and "₹450" in d["body_text"],
+          f"copywriter: still failing after one regenerate -> draft kept with warnings ({d['warnings']})")
+
+    fake, calls = _scripted(bad["brand"], RuntimeError("ASI:One unavailable"))
+    d = (await _draft_with(fake, args))["drafts"][0]
+    check(len(calls) == 2 and d["warnings"] and "Bean Co" not in d["body_text"],
+          "copywriter: regenerate error -> first draft kept with its warnings")
+
+    async def per_lead(profile, lead, qualification, style_rules, problems=None):
+        if lead["id"] == "broken":
+            raise ValueError("LLM did not return JSON")
+        return dict(GOOD)
+
+    seen: list[str] = []
+
+    async def recording(profile, lead, qualification, style_rules, problems=None):
+        seen.append(lead["id"])
+        return await per_lead(profile, lead, qualification, style_rules, problems)
+
+    out = await _draft_with(recording, dict(args, leads=[_lead("tapri"), _lead("broken"), _lead("nomail")],
+                                            contacts=contacts + [{"lead_id": "broken", "email": "hi@broken.test"}]))
+    skipped = {s["lead_id"]: s["reason"] for s in out["skipped"]}
+    check([x["lead_id"] for x in out["drafts"]] == ["tapri"] and skipped == {"broken": "llm_failed", "nomail": "no_contact"}
+          and "nomail" not in seen, f"copywriter: LLM failure / no contact -> skipped, others still drafted ({skipped})")
+
+    try:
+        await copywriter.draft_emails({"profile": PROFILE})
+        check(False, "copywriter: missing leads raises ValueError")
+    except ValueError:
+        check(True, "copywriter: missing leads raises ValueError")
+
+
 @user.on_event("startup")
 async def run_script(ctx: Context):
     await asyncio.sleep(2)
@@ -482,9 +612,47 @@ async def run_script(ctx: Context):
         check(msg is not None and "Orders: orders@brewlab.test" in text_of(msg)
               and "https://brewlab.test/contact" in text_of(msg), "'show lead N' detail card shows evidence + URL")
 
+        msg = await say(ctx, "approve", has_text("Draft 1/"))
+        drafts = camp()["drafts"]
+        check(msg is not None and camp()["state"] == st.AWAIT_DRAFTS and len(drafts) == 1
+              and drafts[0]["to"] == "owner@brewlab.test" and drafts[0]["warnings"] == []
+              and drafts[0]["hook_used"] == "Takes orders by email", "draft card shown: primary contact, valid draft")
+        no_contact = [x["name"] for x in camp()["leads"] if x["id"] != "web:brew-lab-roasters"]
+        check(msg is not None and bool(no_contact)
+              and all(f"{name} (no email found)" in text_of(msg).split("\n")[0] for name in no_contact),
+              f"draft card says which leads got no draft and why ({text_of(msg).split(chr(10))[0] if msg else None})")
+
+        msg = await say(ctx, "make this one shorter", has_text("Rewrote this draft"))
+        check(msg is not None and camp()["style_rules"] == [] and draft_calls[-1]["style_rules"] == ["make this one shorter"]
+              and "make this one shorter" in camp()["drafts"][0]["body_text"],
+              "edit_draft on one draft rewrites that draft only, no style rule saved")
+
+        msg = await say(ctx, "never mention discounts", has_text("style rule"))
+        check(msg is not None and (card_meta(msg) or {}).get("card_kind") == "review"
+              and camp()["pending_style_rule"] == "never mention discounts" and camp()["style_rules"] == [],
+              "general edit -> style-rule confirmation card, rule not saved yet")
+        msg = await say(ctx, json.dumps({"action": "reject", "step": "style_rule"}), has_text("this draft only"))
+        check(msg is not None and camp()["style_rules"] == [] and camp()["pending_style_rule"] is None
+              and draft_calls[-1]["style_rules"] == ["never mention discounts"],
+              "'just this draft' -> applied to the current draft, not saved as a rule")
+
+        calls_before = len(draft_calls)
+        msg = await say(ctx, "make them warmer", has_text("style rule"))
+        check(msg is not None and camp()["style_rules"] == [] and len(draft_calls) == calls_before,
+              "general edit waits for confirmation (no rewrite yet)")
+        msg = await say(ctx, "yes", has_text("Saved style rule"))
+        d = camp()["drafts"][0]
+        check(msg is not None and camp()["style_rules"] == ["make them warmer"]
+              and draft_calls[-1]["style_rules"] == ["make them warmer"] and "make them warmer" in d["body_text"]
+              and d["approved"] is False and camp()["state"] == st.AWAIT_DRAFTS,
+              "confirmed style rule saved to the campaign and unapproved drafts rewritten")
+        check(any(e["action"] == "style rule added" and e["actor"] == "user" for e in camp()["log"]),
+              "audit log records the style rule")
+
         msg = await say(ctx, "approve", has_text("failed", "retry"))
-        check(msg is not None, "unimplemented drafts step fails gracefully with retry/skip")
-        check(camp()["state"] == st.STEP_FAILED and camp()["failed_gate"] == "drafts", "state STEP_FAILED")
+        check(msg is not None and camp()["drafts"][0]["approved"] is True, "approving the last draft moves to send")
+        check(camp()["state"] == st.STEP_FAILED and camp()["failed_gate"] == "send",
+              "unimplemented send step fails gracefully: STEP_FAILED")
 
         msg = await say(ctx, "stop asking me about contacts", has_text("auto-approve"))
         check(msg is not None and camp()["settings"]["ask_before"]["contacts"] is False, "NL settings change")
