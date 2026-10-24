@@ -219,6 +219,44 @@ async def unit_tests():
     check([x["name"] for x in out["call_list"]] == ["Chai Point Corner"], "phone-only business goes to call list")
 
     await contact_unit_tests()
+    await llm_request_tests()
+
+
+class FakeCompletions:
+    """Records the kwargs complete() sends to chat.completions.create (no network)."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        msg = type("Msg", (), {"content": '{"ok": true}'})()
+        return type("Resp", (), {"choices": [type("Choice", (), {"message": msg})()]})()
+
+
+async def llm_request_tests():
+    fake = FakeCompletions()
+    fake_client = type("Client", (), {"chat": type("Chat", (), {"completions": fake})()})()
+    env_keys = ("ASI1_WEB_SEARCH", "ASI1_SEARCH_CONTEXT")  # .env is loaded by common; test the defaults
+    original_client, original_env = llm._client, {k: os.environ.pop(k, None) for k in env_keys}
+    llm._client = fake_client
+    try:
+        await llm.complete([{"role": "user", "content": "hi"}])
+        await llm.complete([{"role": "user", "content": "find cafes"}], web_search=True)
+        os.environ["ASI1_WEB_SEARCH"] = "false"
+        await llm.complete([{"role": "user", "content": "find cafes"}], web_search=True)
+    finally:
+        llm._client = original_client
+        for k, v in original_env.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+    plain, search, disabled = [{**c, **(c.get("extra_body") or {})} for c in fake.calls]  # body as sent
+    check(not any("web_search" in c for c in (plain, search, disabled)), "llm: never sends a `web_search` key")
+    check(search.get("web_search_options") == {"search_context_size": "medium"},
+          "llm: web_search=True sends web_search_options {search_context_size: medium}")
+    check("web_search_options" not in plain and "web_search_options" not in disabled,
+          "llm: no search field without web_search or with ASI1_WEB_SEARCH=false")
 
 
 def _lead(lead_id: str, website: str | None = None, osm_emails: list[str] | None = None) -> dict:

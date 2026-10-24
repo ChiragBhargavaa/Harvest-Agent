@@ -29,13 +29,19 @@ def client() -> AsyncOpenAI:
 
 async def complete(messages: list[dict], max_tokens: int = 1024, temperature: float = 0.2,
                    web_search: bool = False) -> str:
+    # ASI:One opts into search by the *presence* of web_search_options (only search_context_size is allowed);
+    # the old `web_search` boolean is rejected with HTTP 400, so without search send no search field at all.
+    extra = {}
+    if web_search and env_bool("ASI1_WEB_SEARCH", True):
+        extra["web_search_options"] = {"search_context_size": os.getenv("ASI1_SEARCH_CONTEXT", "medium")}
+
     async def _call():
         r = await client().chat.completions.create(
             model=ASI1_MODEL,
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
-            extra_body={"web_search": web_search and env_bool("ASI1_WEB_SEARCH", True)},
+            **extra,
         )
         return r.choices[0].message.content or ""
 

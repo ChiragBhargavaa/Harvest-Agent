@@ -344,8 +344,9 @@ ANY --status--> status detail card;  --log--> last 10 audit entries
 ### 3.12 LLM prompts (ASI:One LLM via `agents/llm.py`)
 All prompts demand **JSON only** (`complete_json`: parse, retry once with the error, then raise). Prompts in code:
 `parse_intent`, `build_icp`, `discover_businesses` (web search), `find_websites` (web search), `qualify`, `draft_email`,
-`classify_reply`. Web search is enabled per call with `extra_body={"web_search": True}` (§4.4) and can be turned off with
-`ASI1_WEB_SEARCH=false`.
+`classify_reply`. Web search is enabled per call (`complete(..., web_search=True)`) by sending
+`web_search_options={"search_context_size": ASI1_SEARCH_CONTEXT}` (§4.4); calls without search send no search field at all.
+It can be turned off with `ASI1_WEB_SEARCH=false`.
 
 **Deterministic draft validator (M4, copywriter):** word count ≤ `max_words`; subject ≤ 8 words and ≤ 60 chars; exact unsubscribe
 line; sender name and brand present; no `{` `}` placeholders; no price unless `mention_price`; `hook_used` matches a review hook.
@@ -413,6 +414,7 @@ latest year seen, keyword flags (online ordering, menu, events, catering), app-s
 | Var | Meaning |
 |---|---|
 | `ASI1_API_KEY`, `ASI1_MODEL`, `ASI1_WEB_SEARCH` | ASI:One LLM (`asi1`), web search on/off |
+| `ASI1_SEARCH_CONTEXT` | Web-search `search_context_size`: `low` \| `medium` (default) \| `high` |
 | `ORCH_SEED`, `FINDER_SEED`, `CONTACT_SEED`, `ANALYST_SEED`, `WRITER_SEED`, `SENDER_SEED` | Seeds fix the agent addresses. Keep stable and secret. |
 | `LEAD_FINDER_AGENT_ADDRESS`, `CONTACT_FINDER_AGENT_ADDRESS`, `LEAD_ANALYST_AGENT_ADDRESS`, `COPYWRITER_AGENT_ADDRESS`, `SENDER_AGENT_ADDRESS` | Derived: `Identity.from_seed(seed, 0).address` ✅ |
 | `FOURSQUARE_API_KEY`, `GOOGLE_PLACES_API_KEY` | Optional extra lead sources (unused unless set) |
@@ -445,7 +447,7 @@ Shared modules are fine for mailbox agents run from this repo. If an agent moves
 helpers into one file (§4.7).
 
 ### 3.18 Milestones and acceptance tests
-**Mock test** ✅ (`agents/mock_test.py`, 36 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
+**Mock test** ✅ (`agents/mock_test.py`, 39 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
 fetcher and `mx_ok` are monkeypatched; all agents + a scripted user run in a `Bureau(port=8010)`; exit code 0 = pass.
 
 | Milestone | Done when |
@@ -530,7 +532,12 @@ fetcher and `mx_ok` are monkeypatched; all agents + a scripted user run in a `Bu
 ### 4.4 ASI:One LLM
 - **Client:** OpenAI-compatible: `OpenAI(base_url="https://api.asi1.ai/v1", api_key=ASI1_API_KEY)`. ✅ Per the Innovation Lab guide; implemented in `agents/llm.py`.
 - **Model names:** `asi1` (default, balanced), `asi1-ultra` (deepest reasoning, agentic runs), `asi1-mini` (fastest) per the current quickstart ✅. Older docs mention `asi1-fast`/`asi1-extended`.
-- **Web search:** ASI-specific boolean `web_search`, passed in Python as `extra_body={"web_search": True}` (OpenAI-compatibility doc) ✅ documented; whether replies include source URLs is undocumented ⚠️ → `scripts/probe_sources.py`.
+- **Web search:** on `/v1/chat/completions` pass a `web_search_options` object; its presence is the opt-in, and without it there is
+  no search. Allowed values: `{}` or `{"search_context_size": "low|medium|high"}`; any other key → HTTP 400 (ASI:One web-search doc).
+  In Python: `client.chat.completions.create(..., web_search_options={"search_context_size": "medium"})` (native kwarg in the
+  installed `openai` SDK). ❌ The old boolean `extra_body={"web_search": True}` from the OpenAI-compatibility doc is now rejected
+  with HTTP 400 "Unrecognized request argument supplied: web_search", even when `False` (verified live 24 Oct 2026).
+  Whether replies include source URLs is undocumented ⚠️ → `scripts/probe_sources.py`.
 - **API key:** asi1.ai → Developer → API Keys. An ASI:One Pro/Premium subscription does not by itself put a key in `.env`.
 - **Agentic models** (`asi1-agentic`, `asi1-fast-agentic`, `asi1-extended-agentic`) search and call Agentverse agents themselves and need an `x-session-id` header. Not needed for LeadReach.
 - **Using it for decisions** (intent, hooks, drafts, classification) is what the "ASI:One LLM central to reasoning" criterion rewards.
@@ -762,7 +769,8 @@ agent.include(pay_proto, publish_manifest=True)
 **External services**
 - Overpass QL: https://wiki.openstreetmap.org/wiki/Overpass_API/Overpass_QL
 - Nominatim usage policy: https://operations.osmfoundation.org/policies/nominatim/
-- ASI:One OpenAI compatibility (web_search): https://innovationlab.fetch.ai/resources/docs/asione/build/openai-compatibility
+- ASI:One web search (`web_search_options`): https://docs.asi1.ai/documentation/build-with-asi-one/web-search.md
+- ASI:One OpenAI compatibility (outdated `web_search` boolean): https://innovationlab.fetch.ai/resources/docs/asione/build/openai-compatibility
 - Google Places Text Search (New), optional: https://developers.google.com/maps/documentation/places/web-service/text-search
 - Foursquare pricing, optional: https://foursquare.com/pricing/
 - Fetch.ai Google Maps Places Agent source (not used): https://github.com/fetchai/uAgent-Examples/tree/main/6-deployed-agents/geo/google-maps-places-agent
