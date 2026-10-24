@@ -29,6 +29,20 @@ Addresses are fixed by the seeds in `.env` (keep that file; `bash setup.sh` prin
 | Copywriter | `leadreach-writer` | Short personal drafts (ASI:One) + deterministic validator | ✅ implemented | `agent1q2ttlc7yh8dwy4vj8knr6jhmguy9pcp0a8zawtwnf3up26zgdq6qsaech9t` | [profile](https://agentverse.ai/agents/details/agent1q2ttlc7yh8dwy4vj8knr6jhmguy9pcp0a8zawtwnf3up26zgdq6qsaech9t/profile) |
 | Sender (stretch) | `leadreach-sender` | Placeholder: runs and answers, but `send_emails` replies "not implemented yet"; nothing is ever sent | ⏸ not part of this demo (DRY_RUN only) | `agent1q007hz3k52l3pjuwxxfrn28a6xv768alq5jygldx3x7ae6had0d47gtw337` | [profile](https://agentverse.ai/agents/details/agent1q007hz3k52l3pjuwxxfrn28a6xv768alq5jygldx3x7ae6had0d47gtw337/profile) |
 
+### Hosted on Agentverse
+
+The same specialists also run as Agentverse **hosted** agents (same `leadreach-tools` v0.1.0 protocol; the hosted sender
+never sends email). The hosted orchestrator address is coming soon; until then the orchestrator above is the entry point.
+
+| Agent | Name | Address | Agentverse profile |
+|---|---|---|---|
+| Orchestrator | `Harvest Agent` (hosted) | coming soon | — |
+| Lead Finder | `Harvest Finder` (hosted) | `agent1qtxuptksgslfrj69elx4pn4gkll007t0ve7spxl9tjkej8ck0gqusqk2ftn` | [profile](https://agentverse.ai/agents/details/agent1qtxuptksgslfrj69elx4pn4gkll007t0ve7spxl9tjkej8ck0gqusqk2ftn/profile) |
+| Contact Finder | `Harvest Contacts` (hosted) | `agent1q28zez90a936easmmmvnnu27seet374mk3geynhynr4ewhxvuryygqj6z4x` | [profile](https://agentverse.ai/agents/details/agent1q28zez90a936easmmmvnnu27seet374mk3geynhynr4ewhxvuryygqj6z4x/profile) |
+| Lead Analyst | `Harvest Analyst` (hosted) | `agent1qv6pdx6q5wjt0xjf5xqe9790tfj88wcwq4np3npsrcec7pv2xpxw6hf3hye` | [profile](https://agentverse.ai/agents/details/agent1qv6pdx6q5wjt0xjf5xqe9790tfj88wcwq4np3npsrcec7pv2xpxw6hf3hye/profile) |
+| Copywriter | `Harvest Writer` (hosted) | `agent1qd5wnsklhrqu2h4zpc0g7prmu0r97l38d9f0d8pvt2dgjql5u8hykpmf8u3` | [profile](https://agentverse.ai/agents/details/agent1qd5wnsklhrqu2h4zpc0g7prmu0r97l38d9f0d8pvt2dgjql5u8hykpmf8u3/profile) |
+| Sender (stretch) | `Harvest Sender` (hosted) | `agent1q2cfzh9qzdpgs7puw7zne4teskmda97cmfdn03upudq6m4j0aln9umw7aww` | [profile](https://agentverse.ai/agents/details/agent1q2cfzh9qzdpgs7puw7zne4teskmda97cmfdn03upudq6m4j0aln9umw7aww/profile) |
+
 The demo workflow ends at approved drafts. At the send checkpoint the orchestrator reports that sending isn't available and
 offers **skip** to finish the campaign. Sending (M6) and the M5 extras (`add lead`, `import list`, reply classification) are
 out of scope for this submission.
