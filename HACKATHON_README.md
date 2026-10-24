@@ -502,6 +502,7 @@ latest year seen, keyword flags (online ordering, menu, events, catering), app-s
 - Partial success is fine (e.g. OSM down → web-search leads; web search down → OSM leads). Report what's missing and why
   (`source_notes`).
 - `send_and_receive` → `None` or `ok=False` → tell the user plainly and offer **retry** / **skip** (`STEP_FAILED`). Never silently move on.
+- Every orchestrator `ctx.send` to the user (ack, chat text, checkpoint card, form) goes through `common.send_reliably`: up to 2 retries on an exception or delivery status `failed`, and one log line per attempt, `<what> sent to <sender[:14]>… status=<delivery status or exception>`. The message body is not logged. `send_and_receive` (specialist calls, resend, local fallback) is unchanged.
 - Re-running a step replaces that step's output, never duplicates it.
 - The orchestrator's chat handler catches everything and always replies.
 
@@ -554,7 +555,7 @@ Shared modules are fine for mailbox agents run from this repo. If an agent moves
 helpers into one file (§4.7).
 
 ### 3.18 Milestones and acceptance tests
-**Mock test** ✅ (`agents/mock_test.py`, 174 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
+**Mock test** ✅ (`agents/mock_test.py`, 182 checks): `MAILBOX=false` + dummy seeds before imports; `llm.*`, `geo.*`, the
 fetcher and `mx_ok` are monkeypatched; all agents + a scripted user run in a `Bureau(port=8010)`; exit code 0 = pass.
 
 | Milestone | Done when |

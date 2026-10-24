@@ -77,7 +77,7 @@ Requires Python 3.10–3.13 and [uv](https://docs.astral.sh/uv/) (`brew install 
 
 ```bash
 bash setup.sh                                  # deps, .env with fresh seeds + derived addresses, local git repo
-.venv/bin/python agents/mock_test.py           # offline end-to-end test (no keys needed), exit 0 = pass (174 checks)
+.venv/bin/python agents/mock_test.py           # offline end-to-end test (no keys needed), exit 0 = pass (182 checks)
 .venv/bin/ruff check agents scripts            # lint
 .venv/bin/python scripts/probe_sources.py Jodhpur salon  # checks OSM + ASI:One web search with your key
 .venv/bin/python agents/local_test.py "I sell a new trimmer - find salons in Jodhpur"   # live loop in the terminal

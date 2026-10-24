@@ -40,6 +40,7 @@ from common import (
     env_seconds,
     redact,
     require_env,
+    send_reliably,
     text_of,
 )
 
@@ -329,13 +330,13 @@ async def run_from(ctx: Context, sender: str, camp: dict, gate: str) -> None:
         else:
             camp["state"] = st.GATE_STATES[gate][0]
             st.save(ctx, sender, camp)
-            await ctx.send(sender, chat_text(PROGRESS[gate]))
+            await send_reliably(ctx, sender, chat_text(PROGRESS[gate]))
             result, error = await call_tool(ctx, GATE_TOOL[gate], step_args(gate, camp))
             if result is None:
                 camp["state"], camp["failed_gate"] = st.STEP_FAILED, gate
                 st.log(camp, gate, "failed", "system", error)
                 name = SPECIALIST_NAMES[GATE_TOOL[gate]]
-                await ctx.send(sender, chat_text(
+                await send_reliably(ctx, sender, chat_text(
                     f"⚠ {name} timed out — reply **retry** to try again, or **skip** to move on."
                     if error.startswith(f"{name} timed out") else
                     f"⚠ The **{gate}** step failed: {error}\n\nReply **retry** to try again, or **skip** to move on."))
@@ -346,19 +347,19 @@ async def run_from(ctx: Context, sender: str, camp: dict, gate: str) -> None:
             st.log(camp, gate, f"produced {count}", "system")
             if gate in ("leads", "drafts") and count == 0:
                 camp["state"] = st.GATE_STATES[gate][1]
-                await ctx.send(sender, chat_text(f"I found nothing for the **{gate}** step. "
+                await send_reliably(ctx, sender, chat_text(f"I found nothing for the **{gate}** step. "
                                                  "Reply **redo** with what to change (another city, more business "
                                                  "types), or **add lead** with a name and website."))
                 return
         if camp["settings"]["ask_before"].get(gate, True):
             camp["state"] = st.GATE_STATES[gate][1]
-            await ctx.send(sender, checkpoint(gate, camp))
+            await send_reliably(ctx, sender, checkpoint(gate, camp))
             return
         st.log(camp, gate, "auto-approved", "ai_auto")
-        await ctx.send(sender, chat_text(f"FYI: **{gate}** auto-approved (you turned that checkpoint off)."))
+        await send_reliably(ctx, sender, chat_text(f"FYI: **{gate}** auto-approved (you turned that checkpoint off)."))
         gate = next_gate(gate)
     camp["state"] = st.DONE
-    await ctx.send(sender, chat_text("Campaign complete. Say **status** for a summary or **new campaign**.",
+    await send_reliably(ctx, sender, chat_text("Campaign complete. Say **status** for a summary or **new campaign**.",
                                      end_session=True))
 
 
@@ -381,7 +382,7 @@ async def build_icp(ctx: Context, sender: str, camp: dict) -> None:
     except Exception as err:  # noqa: BLE001
         camp["state"], camp["failed_gate"] = st.STEP_FAILED, "icp"
         st.log(camp, "icp", "failed", "system", str(err))
-        await ctx.send(sender, chat_text(f"⚠ I couldn't understand the brief right now ({err}). Reply **retry**."))
+        await send_reliably(ctx, sender, chat_text(f"⚠ I couldn't understand the brief right now ({err}). Reply **retry**."))
         return
     st.log(camp, "icp", "built", "system", json.dumps(camp["icp"])[:300])
 
@@ -439,10 +440,10 @@ async def start_campaign(ctx: Context, sender: str, camp: dict, args: dict) -> d
     if not brief or not city:
         camp["state"] = st.SETUP
         default_city = load_profile().get("targeting", {}).get("default_city")
-        await ctx.send(sender, cards.setup_form(None if str(default_city).startswith("❓") else default_city))
+        await send_reliably(ctx, sender, cards.setup_form(None if str(default_city).startswith("❓") else default_city))
         return camp
     if cap_reached(ctx, sender):  # dispatch checks first; this guards a direct call
-        await ctx.send(sender, chat_text(CAP_REPLY))
+        await send_reliably(ctx, sender, chat_text(CAP_REPLY))
         return camp
     camp = st.new_campaign(camp)
     note_campaign(ctx, sender)
@@ -459,7 +460,7 @@ async def start_campaign(ctx: Context, sender: str, camp: dict, args: dict) -> d
 async def approve(ctx: Context, sender: str, camp: dict, args: dict) -> None:
     gate = st.pending_gate(camp)
     if gate is None:
-        await ctx.send(sender, chat_text("There's nothing waiting for approval. Say **status** or **help**."))
+        await send_reliably(ctx, sender, chat_text("There's nothing waiting for approval. Say **status** or **help**."))
         return
     if await answer_style_rule(ctx, sender, camp, args, accepted=True):
         return
@@ -472,7 +473,7 @@ async def approve(ctx: Context, sender: str, camp: dict, args: dict) -> None:
             camp["draft_cursor"] = len(camp["drafts"]) - 1
         if camp["draft_cursor"] + 1 < len(camp["drafts"]):
             camp["draft_cursor"] += 1
-            await ctx.send(sender, checkpoint("drafts", camp))
+            await send_reliably(ctx, sender, checkpoint("drafts", camp))
             return
     else:
         st.log(camp, gate, "approved")
@@ -484,7 +485,7 @@ async def approve(ctx: Context, sender: str, camp: dict, args: dict) -> None:
 async def reject(ctx: Context, sender: str, camp: dict, args: dict) -> None:
     gate = st.pending_gate(camp)
     if gate is None:
-        await ctx.send(sender, chat_text("Nothing to redo right now. Say **status** or **help**."))
+        await send_reliably(ctx, sender, chat_text("Nothing to redo right now. Say **status** or **help**."))
         return
     if await answer_style_rule(ctx, sender, camp, args, accepted=False):
         return
@@ -495,7 +496,7 @@ async def reject(ctx: Context, sender: str, camp: dict, args: dict) -> None:
         return
     redo = camp["redo_count"].get(gate, 0)
     if redo >= st.MAX_REDOS:
-        await ctx.send(sender, chat_text(f"I've redone **{gate}** {redo} times. Try changing the inputs: a different "
+        await send_reliably(ctx, sender, chat_text(f"I've redone **{gate}** {redo} times. Try changing the inputs: a different "
                                          "city or business type, or start a **new campaign**."))
         return
     camp["redo_count"][gate] = redo + 1
@@ -516,7 +517,7 @@ async def reject(ctx: Context, sender: str, camp: dict, args: dict) -> None:
 async def approve_cursor_advance(ctx: Context, sender: str, camp: dict) -> None:
     if camp["draft_cursor"] + 1 < len(camp["drafts"]):
         camp["draft_cursor"] += 1
-        await ctx.send(sender, checkpoint("drafts", camp))
+        await send_reliably(ctx, sender, checkpoint("drafts", camp))
     else:
         await run_from(ctx, sender, camp, "send")
 
@@ -528,7 +529,7 @@ async def redraft(ctx: Context, sender: str, camp: dict, lead_ids: list[str], ex
                 style_rules=camp["style_rules"] + extra_rules)
     if not args["leads"]:
         return "those leads are no longer in the campaign"
-    await ctx.send(sender, chat_text("Rewriting..."))
+    await send_reliably(ctx, sender, chat_text("Rewriting..."))
     result, error = await call_tool(ctx, "draft_emails", args)
     if result is None:
         return error
@@ -542,16 +543,16 @@ async def edit_draft(ctx: Context, sender: str, camp: dict, args: dict) -> None:
     """A specific edit rewrites one draft; a general one is proposed as a style rule and waits for confirmation."""
     instruction = str(args.get("instruction") or "").strip()
     if st.pending_gate(camp) != "drafts" or not camp["drafts"]:
-        await ctx.send(sender, chat_text("I can edit emails once the drafts are ready (at the drafts checkpoint)."))
+        await send_reliably(ctx, sender, chat_text("I can edit emails once the drafts are ready (at the drafts checkpoint)."))
         return
     if not instruction:
-        await ctx.send(sender, chat_text("How should I change it? e.g. *\"shorter and warmer\"*."))
+        await send_reliably(ctx, sender, chat_text("How should I change it? e.g. *\"shorter and warmer\"*."))
         return
     general = args.get("general")
     if general is True or (not isinstance(general, bool) and _truthy(general)):
         camp["pending_style_rule"] = instruction
         st.log(camp, "drafts", "style rule proposed", "system", instruction)
-        await ctx.send(sender, cards.style_rule_card(instruction))
+        await send_reliably(ctx, sender, cards.style_rule_card(instruction))
         return
     lead_ids = [d["lead_id"] for d in camp["drafts"]]
     if args.get("lead_id") in lead_ids:  # a draft card's lead_id; otherwise the draft on screen
@@ -561,7 +562,7 @@ async def edit_draft(ctx: Context, sender: str, camp: dict, args: dict) -> None:
     error = await redraft(ctx, sender, camp, [current], [instruction])
     note = f"⚠ I couldn't rewrite it ({error}); here's the previous version." if error \
         else f"Rewrote this draft: *\"{instruction}\"*."
-    await ctx.send(sender, checkpoint("drafts", camp, note))
+    await send_reliably(ctx, sender, checkpoint("drafts", camp, note))
 
 
 async def answer_style_rule(ctx: Context, sender: str, camp: dict, args: dict, accepted: bool) -> bool:
@@ -585,7 +586,7 @@ async def answer_style_rule(ctx: Context, sender: str, camp: dict, args: dict, a
         st.log(camp, "drafts", f"edited {current}", "user", rule)
         error = await redraft(ctx, sender, camp, [current], [rule])
         note = f"⚠ I couldn't rewrite it ({error})." if error else f"Applied *\"{rule}\"* to this draft only."
-    await ctx.send(sender, checkpoint("drafts", camp, note))
+    await send_reliably(ctx, sender, checkpoint("drafts", camp, note))
     return True
 
 
@@ -594,20 +595,20 @@ async def remove_items(ctx: Context, sender: str, camp: dict, args: dict) -> Non
     positions = [int(i) for i in args.get("ids", []) if str(i).isdigit()]
     ids = {camp["last_list"][p - 1] for p in positions if 0 < p <= len(camp["last_list"])}
     if gate not in ("leads", "contacts", "reviews") or not ids:
-        await ctx.send(sender, chat_text("Tell me which numbers to remove from the last list, e.g. **remove 2, 5**."))
+        await send_reliably(ctx, sender, chat_text("Tell me which numbers to remove from the last list, e.g. **remove 2, 5**."))
         return
     camp["removed_ids"] = list(set(camp["removed_ids"]) | ids)
     for key in ("leads", "contacts", "reviews"):
         camp[key] = [x for x in camp[key] if x.get("id", x.get("lead_id")) not in ids]
     st.log(camp, gate, f"removed {len(ids)}", "user", ", ".join(sorted(ids)))
-    await ctx.send(sender, checkpoint(gate, camp))
+    await send_reliably(ctx, sender, checkpoint(gate, camp))
 
 
 async def show_lead(ctx: Context, sender: str, camp: dict, args: dict) -> None:
     ids = args.get("ids") or []
     lead_ids = camp["last_list"] or [lead["id"] for lead in camp["leads"]]
     if not ids or not str(ids[0]).isdigit() or not 0 < int(ids[0]) <= len(lead_ids):
-        await ctx.send(sender, chat_text("Which one? e.g. **show lead 2**."))
+        await send_reliably(ctx, sender, chat_text("Which one? e.g. **show lead 2**."))
         return
     lead_id = lead_ids[int(ids[0]) - 1]
     lead = next((x for x in camp["leads"] if x["id"] == lead_id), {"name": lead_id})
@@ -620,7 +621,7 @@ async def show_lead(ctx: Context, sender: str, camp: dict, args: dict) -> None:
     rows += [{"label": h.get("observation", "hook"), "value": f"\"{h.get('evidence')}\" ({h.get('evidence_url')})"}
              for h in review.get("hooks", [])]
     narration = f"**{lead['name']}**\n" + "\n".join(f"- {r['label']}: {r['value']}" for r in rows)
-    await ctx.send(sender, cards.detail_card(lead["name"], rows, [], narration, terminal=True))
+    await send_reliably(ctx, sender, cards.detail_card(lead["name"], rows, [], narration, terminal=True))
 
 
 def _truthy(v) -> bool:
@@ -642,10 +643,10 @@ async def update_settings(ctx: Context, sender: str, camp: dict, args: dict) -> 
         s["dry_run"] = args["dry_run"] if isinstance(args["dry_run"], bool) else _truthy(args["dry_run"])
         changes.append(f"dry run {'on' if s['dry_run'] else 'OFF'}")
     if not changes:
-        await ctx.send(sender, cards.settings_form(s))
+        await send_reliably(ctx, sender, cards.settings_form(s))
         return
     st.log(camp, "settings", "; ".join(changes))
-    await ctx.send(sender, chat_text("Done: " + "; ".join(changes) + "."))
+    await send_reliably(ctx, sender, chat_text("Done: " + "; ".join(changes) + "."))
 
 
 async def clarify(ctx: Context, sender: str, camp: dict) -> None:
@@ -654,41 +655,41 @@ async def clarify(ctx: Context, sender: str, camp: dict) -> None:
         None: "start a campaign (e.g. *\"find cafés in Jaipur for my coffee brand\"*), **status** or **help**",
         "drafts": "**approve**, **skip**, **approve all**, or tell me how to edit the draft",
     }.get(gate, "**approve**, **remove 2, 5**, **redo** with feedback, or **show lead 3**")
-    await ctx.send(sender, chat_text(f"Sorry, I didn't catch that. Here you can: {options}."))
+    await send_reliably(ctx, sender, chat_text(f"Sorry, I didn't catch that. Here you can: {options}."))
 
 
 async def dispatch(ctx: Context, sender: str, camp: dict, cmd: dict) -> dict:
     intent, args = cmd["intent"], cmd.get("args") or {}
     if camp["state"] == st.PAUSED and intent not in ("resume", "status", "help", "show_log", "update_settings"):
-        await ctx.send(sender, chat_text("Everything is paused. Say **resume** to continue."))
+        await send_reliably(ctx, sender, chat_text("Everything is paused. Say **resume** to continue."))
         return camp
     if intent == "help":
-        await ctx.send(sender, chat_text(HELP))
+        await send_reliably(ctx, sender, chat_text(HELP))
     elif intent == "status":
-        await ctx.send(sender, cards.status_card(camp))
+        await send_reliably(ctx, sender, cards.status_card(camp))
     elif intent == "show_log":
         lines = [f"- {e['ts'][5:16]} · {e['step']} · {e['action']} ({e['actor']})" for e in camp["log"][-10:]]
-        await ctx.send(sender, chat_text("**Audit log (last 10)**\n" + ("\n".join(lines) or "empty")))
+        await send_reliably(ctx, sender, chat_text("**Audit log (last 10)**\n" + ("\n".join(lines) or "empty")))
     elif intent == "settings" or (intent == "update_settings" and not args):
-        await ctx.send(sender, cards.settings_form(camp["settings"]))
+        await send_reliably(ctx, sender, cards.settings_form(camp["settings"]))
     elif intent == "update_settings":
         await update_settings(ctx, sender, camp, args)
     elif intent == "pause":
         if camp["state"] != st.PAUSED:
             camp["paused_from"], camp["state"] = camp["state"], st.PAUSED
             st.log(camp, "campaign", "paused")
-        await ctx.send(sender, chat_text("⏸ Paused. Nothing will run or send until you say **resume**."))
+        await send_reliably(ctx, sender, chat_text("⏸ Paused. Nothing will run or send until you say **resume**."))
     elif intent == "resume":
         if camp["state"] == st.PAUSED:
             camp["state"], camp["paused_from"] = camp["paused_from"] or st.IDLE, None
             st.log(camp, "campaign", "resumed")
             gate = st.pending_gate(camp)
-            await ctx.send(sender, checkpoint(gate, camp) if gate else chat_text("▶ Resumed."))
+            await send_reliably(ctx, sender, checkpoint(gate, camp) if gate else chat_text("▶ Resumed."))
         else:
-            await ctx.send(sender, chat_text("Nothing is paused."))
+            await send_reliably(ctx, sender, chat_text("Nothing is paused."))
     elif intent == "start_campaign":
         if cap_reached(ctx, sender):
-            await ctx.send(sender, chat_text(CAP_REPLY))
+            await send_reliably(ctx, sender, chat_text(CAP_REPLY))
         else:
             camp = await start_campaign(ctx, sender, camp, args)
     elif camp["state"] == st.STEP_FAILED and intent in ("retry", "approve"):
@@ -697,7 +698,10 @@ async def dispatch(ctx: Context, sender: str, camp: dict, cmd: dict) -> dict:
         gate = camp.get("failed_gate") or "icp"
         st.log(camp, gate, "skipped after failure")
         nxt = next_gate(gate)
-        await (run_from(ctx, sender, camp, nxt) if nxt else ctx.send(sender, chat_text("Nothing left to skip to.")))
+        if nxt:
+            await run_from(ctx, sender, camp, nxt)
+        else:
+            await send_reliably(ctx, sender, chat_text("Nothing left to skip to."))
     elif intent == "approve":
         await approve(ctx, sender, camp, args)
     elif intent == "reject":
@@ -709,15 +713,15 @@ async def dispatch(ctx: Context, sender: str, camp: dict, cmd: dict) -> dict:
     elif intent == "call_list":
         rows = [f"- {x['name']} · {x.get('phone')} · {x.get('address') or ''}" for x in camp["call_list"]]
         body = "\n".join(rows) or "none"
-        await ctx.send(sender, chat_text("**Phone-only businesses** (no published email)\n" + body))
+        await send_reliably(ctx, sender, chat_text("**Phone-only businesses** (no published email)\n" + body))
     elif intent == "edit_draft":
         await edit_draft(ctx, sender, camp, args)
     elif intent == "buy_lead_pack":
         await payments.offer(ctx, sender, camp)
     elif intent in ("add_lead", "import_list", "classify_reply"):
-        await ctx.send(sender, chat_text(f"*{intent.replace('_', ' ')}* isn't part of this demo yet. {HELP}"))
+        await send_reliably(ctx, sender, chat_text(f"*{intent.replace('_', ' ')}* isn't part of this demo yet. {HELP}"))
     elif camp["state"] in (st.IDLE, st.SETUP, st.DONE) and cmd.get("confidence", 0) < 0.6:
-        await ctx.send(sender, chat_text(HELP))
+        await send_reliably(ctx, sender, chat_text(HELP))
     else:
         await clarify(ctx, sender, camp)
     return camp
@@ -725,7 +729,7 @@ async def dispatch(ctx: Context, sender: str, camp: dict, cmd: dict) -> dict:
 
 @chat_proto.on_message(ChatMessage)
 async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
-    await ctx.send(sender, ack(msg))
+    await send_reliably(ctx, sender, ack(msg))
     text = text_of(msg)
     if not text:  # e.g. a StartSessionContent-only message
         return
@@ -733,7 +737,7 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
     camp = st.load(ctx, sender)
     # No active campaign and the daily cap is full: don't call understand() or the LLM.
     if camp["state"] in (st.IDLE, st.SETUP, st.DONE) and cap_reached(ctx, sender) and not _cap_free_phrase(text):
-        await ctx.send(sender, chat_text(CAP_REPLY))
+        await send_reliably(ctx, sender, chat_text(CAP_REPLY))
         return
     try:
         cmd = await understand(text, camp)
@@ -741,7 +745,7 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
         camp = await dispatch(ctx, sender, camp, cmd)
     except Exception:  # noqa: BLE001 - never leave the user without a reply
         ctx.logger.exception("handler failed")
-        await ctx.send(sender, chat_text("Something went wrong on my side. Your campaign is saved - "
+        await send_reliably(ctx, sender, chat_text("Something went wrong on my side. Your campaign is saved - "
                                          "say **status** to see where we are, or **retry**."))
     st.save(ctx, sender, camp)
 

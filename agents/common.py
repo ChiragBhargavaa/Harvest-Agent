@@ -17,6 +17,7 @@ from uagents_core.contrib.protocols.chat import (
     ChatAcknowledgement,
     ChatMessage,
     EndSessionContent,
+    MetadataContent,
     TextContent,
 )
 
@@ -111,6 +112,71 @@ def agent_address(seed_env: str) -> str:
     from uagents.crypto import Identity
 
     return Identity.from_seed(require_env(seed_env), 0).address
+
+
+def send_label(msg) -> str:
+    """What an orchestrator reply is, for the send log. Never the message body."""
+    if isinstance(msg, ChatAcknowledgement):
+        return "ack"
+    if isinstance(msg, ChatMessage):
+        for part in msg.content:
+            if isinstance(part, MetadataContent):
+                kind = str((part.metadata or {}).get("card_kind") or "")
+                return "form" if kind == "form" else "card"
+        return "chat"
+    return type(msg).__name__
+
+
+def _delivery_value(status) -> str:
+    """MsgStatus.delivery_status when that attribute exists, otherwise MsgStatus.status."""
+    if status is None:
+        return "none"
+    value = getattr(status, "delivery_status", None)
+    if value is None:
+        value = getattr(status, "status", None)
+    if value is None:
+        return "none"
+    return str(getattr(value, "value", value))
+
+
+def _exception_status(err: BaseException, msg) -> str:
+    """One-line exception label. Drops the outbound text if a library error quotes it."""
+    detail = redact(str(err)).replace("\n", " ").strip()
+    body = text_of(msg) if isinstance(msg, ChatMessage) else ""
+    if not detail or (body and body in detail):
+        return type(err).__name__
+    return detail[:160] if detail.startswith(type(err).__name__) else f"{type(err).__name__}: {detail[:140]}"
+
+
+def _log_send(ctx, what: str, to: str, status) -> None:
+    logger = getattr(ctx, "logger", None)
+    if logger is not None:
+        logger.info(f"{what} sent to {str(to)[:14]}… status={status}")
+
+
+async def send_reliably(ctx, to: str, msg, *, what: str = "", attempts: int = 3):
+    """Send to the user. Retry ctx.send on an exception or a failed delivery status, at most twice.
+
+    Each attempt logs one line and never the message body:
+    '<what> sent to <sender[:14]>… status=<MsgStatus.delivery_status or exception>'.
+    A missing status (test doubles) is not a failure. Does not raise.
+    """
+    label = what or send_label(msg)
+    tries = max(1, min(int(attempts), 3))
+    last = None
+    for i in range(tries):
+        try:
+            last = await ctx.send(to, msg)
+        except Exception as err:  # noqa: BLE001 - the caller still owes the user a later reply
+            _log_send(ctx, label, to, _exception_status(err, msg))
+            last = None
+            if i < tries - 1:
+                continue
+            return None
+        _log_send(ctx, label, to, _delivery_value(last))
+        if _delivery_value(last) != "failed":
+            return last
+    return last
 
 
 async def with_retry(fn, *args, attempts: int = 3, base_delay: float = 1.0, **kwargs):
